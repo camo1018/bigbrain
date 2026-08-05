@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "hooks": {
+    "postToolUse": [
+      {
+        "command": "./hooks/bigbrain-mark-substantive.sh"
+      }
+    ],
+    "stop": [
+      {
+        "command": "./hooks/bigbrain-maintenance.sh",
+        "loop_limit": 1
+      }
+    ]
+  }
+}

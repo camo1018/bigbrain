@@ -1,0 +1,81 @@
+---
+description: Use the bigbrain memory store to recall and persist durable knowledge across chats
+alwaysApply: true
+---
+
+# bigbrain: persistent agent memory
+
+There is a personal semantic memory store available via the `bigbrain` MCP
+server (tools: `memory_recall`, `memory_store`, `memory_list`, `memory_get`,
+`memory_update`, `memory_delete`, `memory_count`). Treat it as shared long-term
+memory across every chat and repo.
+
+## Core loop: recall → decide → maintain
+Memory is a living store, not an append-only log. Never blindly create a new
+entry. Every write is preceded by a recall and a decision:
+
+1. **Recall first.** Before writing anything, `memory_recall` the topic to see
+   what already exists.
+2. **Decide** based on what recall returns:
+   - **Nothing related** → `memory_store` a fresh entry.
+   - **A related entry exists** (still true, or stale/wrong) → update it in
+     place: re-`memory_store` with the *same topic phrasing* and
+     `on_conflict="replace"` (overwrites) or `"merge"` (appends). Add/refresh
+     only what changed; keep it self-contained. Prefer this over `memory_update`
+     by numeric id, because ids can exceed JavaScript's safe-integer range and
+     round-trip lossily through some MCP transports, silently targeting the
+     wrong entry.
+   - **Duplicates/fragments discovered** → consolidate into one entry and
+     `memory_delete` the extras.
+
+Because dedup/merge keys off the `topic` embedding, reuse consistent, searchable
+topic phrasing so related writes converge on the same memory instead of
+fragmenting it.
+
+## Recall at the start of a task (MANDATORY, not optional)
+`memory_recall` is the **first tool call** you make on any non-trivial task —
+before searching the codebase, running commands, or writing a plan. Do it
+without being asked. "Non-trivial" = anything involving setup, debugging, infra,
+conventions, architecture, ownership, or "how did we do X" (i.e. almost every
+real task). Only a purely conversational reply or a one-line edit is exempt.
+
+This fires unreliably when treated as a soft nudge, so treat it as a hard step:
+
+- **On the first substantive turn** of a conversation, recall before acting.
+- **Whenever the task changes mid-conversation** (new topic, new repo/service,
+  a fresh "now do Y"), recall again for the new topic — a single recall at the
+  start does not cover later pivots.
+- Seed the query with the concrete subject (service/tool/error/decision), not a
+  generic phrase. Run 2–3 focused recalls over different phrasings if the first
+  misses.
+- Use recalled facts instead of re-deriving them. If nothing relevant returns,
+  say so briefly (or just proceed) — but do not skip the recall itself.
+
+## Maintenance pass (run as you finish, or when triggered)
+At the end of a turn — and whenever a hook injects a memory-maintenance
+follow-up — review what just happened and capture durable, reusable learnings
+via the core loop above. Store facts worth recalling later, not transient
+details:
+- Environment/infra gotchas and their fixes (certs, proxies, auth, tooling flags)
+- Conventions and decisions **with rationale** (why X over Y)
+- Codebase/service maps (where things live, entrypoints, cross-repo callers)
+- People/ownership (usernames/handles, service owners)
+
+If nothing durable emerged, do nothing — an empty pass is the correct outcome
+for most trivial exchanges.
+
+For a deliberate cleanup (compacting append-churned entries, consolidating
+duplicates, evicting dead weight), use the `bigbrain-trim` skill on demand —
+never trim as part of this routine per-turn pass.
+
+## Field guidelines
+- `topic`: a short, descriptive, *searchable* key (it becomes the embedding).
+  Reuse phrasing across related writes so they merge.
+- `content`: the full detail, self-contained (no references to a chat session).
+- `tags`: lowercase, reusable (e.g. `infra`, `conventions`, `gotcha`, `project-map`).
+- `importance`: 0.9–1.0 core/frequently-needed, 0.5 default, <0.3 niche.
+
+## Don't
+- Don't store secrets, credentials, or tokens.
+- Don't store one-off, throwaway, or purely conversational context.
+- Don't create a near-duplicate when an existing entry should be updated instead.

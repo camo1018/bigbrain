@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  bigbrain shared memory server (macOS LaunchAgent).
+
+  Runs a single long-lived streamable-HTTP server that every Cursor workbench
+  connects to by URL, so Cursor never spawns a stdio subprocess per workbench.
+  Placeholders (__LIKE_THIS__) are filled in by `bigbrain install-server`.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROGRAM__</string>
+        <string>serve</string>
+        <string>--host</string>
+        <string>__HOST__</string>
+        <string>--port</string>
+        <string>__PORT__</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BIGBRAIN_HOME</key>
+        <string>__BIGBRAIN_HOME__</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>__STDOUT__</string>
+
+    <key>StandardErrorPath</key>
+    <string>__STDERR__</string>
+</dict>
+</plist>

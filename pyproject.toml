@@ -1,0 +1,25 @@
+[project]
+name = "bigbrain"
+version = "0.1.0"
+description = "A hand-rolled semantic agent-memory store (Milvus Lite + local embeddings)."
+readme = "README.md"
+authors = [
+    { name = "Paul Park" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "fastembed>=0.8.0",
+    "mcp[cli]>=1.28.1",
+    "milvus-lite>=3.0",
+    "pymilvus>=3.0.0",
+    "rich>=15.0.0",
+    "typer>=0.26.8",
+]
+
+[project.scripts]
+bigbrain = "bigbrain.cli:main"
+bigbrain-mcp = "bigbrain.mcp_server:main"
+
+[build-system]
+requires = ["uv_build>=0.10.2,<0.11.0"]
+build-backend = "uv_build"

@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# uv / virtualenv
+.venv/
+
+# Local memory database (created at $BIGBRAIN_HOME, but ignore if placed here)
+*.db
+.bigbrain/
+
+# OS
+.DS_Store
