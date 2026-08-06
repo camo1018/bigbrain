@@ -51,22 +51,15 @@ This fires unreliably when treated as a soft nudge, so treat it as a hard step:
 - Use recalled facts instead of re-deriving them. If nothing relevant returns,
   say so briefly (or just proceed) — but do not skip the recall itself.
 
-## Maintenance pass (run as you finish, or when triggered)
-At the end of a turn — and whenever a hook injects a memory-maintenance
-follow-up — review what just happened and capture durable, reusable learnings
-via the core loop above. Store facts worth recalling later, not transient
-details:
-- Environment/infra gotchas and their fixes (certs, proxies, auth, tooling flags)
-- Conventions and decisions **with rationale** (why X over Y)
-- Codebase/service maps (where things live, entrypoints, cross-repo callers)
-- People/ownership (usernames/handles, service owners)
-
-If nothing durable emerged, do nothing — an empty pass is the correct outcome
-for most trivial exchanges.
+## Writing is handled off-session
+A background hook runs the maintenance pass after every substantive turn,
+outside the session. Do not run it inline as you finish — that stores the same
+learning twice and grows entries with near-identical addenda. Write during a
+turn only when asked to remember something.
 
 For a deliberate cleanup (compacting append-churned entries, consolidating
 duplicates, evicting dead weight), use the `bigbrain-trim` skill on demand —
-never trim as part of this routine per-turn pass.
+never as part of routine work.
 
 ## Field guidelines
 - `topic`: a short, descriptive, *searchable* key (it becomes the embedding).
