@@ -126,6 +126,19 @@ Reload Cursor (or toggle the server in Settings → MCP) to pick it up. The agen
 call `memory_recall` at the start of a task and `memory_store` to persist durable
 knowledge.
 
+### On Linux
+
+`install-server` is macOS-only. On Linux, run the same server as a systemd user unit using
+[`systemd/bigbrain.service.template`](systemd/bigbrain.service.template), which has the
+install steps in its header. For Claude Code, register it once at user scope:
+
+```bash
+claude mcp add --scope user --transport http bigbrain http://127.0.0.1:8765/mcp
+```
+
+`--scope user` matters: the default is project-local, which would bind the server to
+whatever directory you happened to run the command from.
+
 ## Agent memory rule (make recall/store automatic)
 
 What turns bigbrain from "a tool you invoke" into "memory that just works" is a **global
@@ -178,32 +191,45 @@ After editing, start a new chat to pick up the changes. You can confirm what's s
 
 ## Memory-maintenance hooks (auto-run the recall/store loop)
 
-The rule tells the agent *what* to do; **Cursor hooks** make sure it actually happens. This
-repo ships a pair of [user-level hooks](https://cursor.com/docs/hooks) that trigger a
-memory-maintenance pass after every **substantive** turn (any turn that used a tool — pure
-conversational turns are skipped):
+The rule tells the agent *what* to do; **hooks** make sure it actually happens. This repo
+ships three scripts that run a memory-maintenance pass after every **substantive** turn (any
+turn that used a tool — pure conversational turns are skipped). The same scripts work on both
+[Cursor](https://cursor.com/docs/hooks) and [Claude Code](https://code.claude.com/docs/en/hooks);
+they read whichever field the host sends.
 
-- `hooks/bigbrain-mark-substantive.sh` — a `postToolUse` hook that drops a per-conversation
-  marker whenever a tool runs.
-- `hooks/bigbrain-maintenance.sh` — a `stop` hook that, when that marker is present, injects a
-  follow-up telling the agent to run the recall → decide → store/replace loop. A `loop_count`
-  guard (plus `loop_limit: 1`) makes it fire at most once per message and never loop.
+- `hooks/bigbrain-mark-substantive.sh` — a `postToolUse` / `PostToolUse` hook that drops a
+  per-session marker whenever a tool runs.
+- `hooks/bigbrain-maintenance.sh` — a `stop` / `Stop` hook that, when that marker is present,
+  hands the pass to a detached background worker and returns immediately.
+- `hooks/bigbrain-maintenance-run.sh` — the worker. It reads the turn out of the session
+  transcript and runs a **headless agent session** (`claude -p` or `cursor-agent -p`) that does
+  the recall → decide → store/replace loop over the bigbrain MCP server.
 
-Because bigbrain memory is cross-repo, these install at the **user level** (`~/.cursor/`), not
-per-project. Install them (and the memory rule) with:
+The pass runs entirely **outside** the session, so it never appears as a turn in the transcript
+you're reading, and the worker cleans up the headless session it creates. Every pass appends one
+line to `~/.bigbrain/maintenance.log`. Nothing loops: the worker exports `BIGBRAIN_MAINT=1`, and
+both hooks short-circuit when they see it.
+
+Because bigbrain memory is cross-repo, these install at the **user level**, not per-project:
 
 ```bash
-uv run bigbrain install-hooks            # scripts + hooks.json merge + rule + skills
-uv run bigbrain install-hooks --no-rule  # hooks only
-uv run bigbrain install-hooks --no-skills # skip the bundled skills
+uv run bigbrain install-hooks                    # Cursor (default) → ~/.cursor
+uv run bigbrain install-hooks --target claude    # Claude Code → ~/.claude
+uv run bigbrain install-hooks --no-rule          # hooks only
+uv run bigbrain install-hooks --no-skills        # skip the bundled skills
 ```
 
-The installer copies the scripts to `~/.cursor/hooks/`, **merges** the entries into
-`~/.cursor/hooks.json` (preserving any hooks you already have, backing up to
-`hooks.json.bak`), installs the rule to `~/.cursor/rules/`, and installs the bundled skills to
-`~/.cursor/skills/`. It's idempotent. The hook scripts require
-[`jq`](https://jqlang.github.io/jq/) on `PATH`. After installing, reload Cursor and approve the
-new hooks.
+The installer copies the scripts to `<config>/hooks/`, **merges** the entries into the host's
+config (`~/.cursor/hooks.json` or `~/.claude/settings.json`, preserving anything already there
+and backing up alongside it), installs the rule to `<config>/rules/`, and installs the bundled
+skills to `<config>/skills/`. It's idempotent. The hook scripts require
+[`jq`](https://jqlang.github.io/jq/) on `PATH`.
+
+The worker is tunable through the environment: `BIGBRAIN_MAINT_MODEL` (defaults to `sonnet` on
+Claude Code, `composer-2.5` on Cursor — small models fail this task, answering in prose without
+calling the tools), `BIGBRAIN_MAINT_TIMEOUT`, `BIGBRAIN_MAINT_LOG`, `BIGBRAIN_MAINT_MAX_CHARS`,
+and `BIGBRAIN_MCP_URL`. Set `BIGBRAIN_MAINT_DRYRUN=1` to print the assembled prompt instead of
+running the pass.
 
 ## Trimming memory (`bigbrain-trim` skill)
 
@@ -214,6 +240,68 @@ maintenance pass that compacts append-churned memories to current-truth, consoli
 duplicates, evicts dead weight, and tidies tags — always behind an explicit approval gate. It
 ships a read-only [`audit.py`](skills/bigbrain-trim/scripts/audit.py) that ranks trim
 candidates. Invoke it by asking the agent to "trim bigbrain memory".
+
+## Syncing two machines (`bigbrain sync`)
+
+Running a store on a laptop *and* a remote dev machine means each one learns things the
+other never sees. `bigbrain sync` reconciles them over ssh, in both directions:
+
+```bash
+bigbrain sync myhost --dry-run   # show what would move
+bigbrain sync myhost             # converge both sides
+```
+
+It needs bigbrain installed on the peer, and only ssh in between — there is no daemon or
+shared database. The peer's entry point defaults to whatever `bigbrain` resolves to on the
+remote `PATH`; ssh runs a non-interactive shell, so pass an absolute path with `--peer-cmd`
+(e.g. `--peer-cmd '~/src/bigbrain/.venv/bin/bigbrain'`) if that misses.
+
+### How it decides
+
+Memories are matched by **id**, which works because ids are random 63-bit integers: a store
+copied to a second machine keeps its ids, and memories created independently on each side
+never collide.
+
+The comparison is **three-way** — each side against the other *and* against a snapshot of
+the last sync, kept in `$BIGBRAIN_HOME/sync-state.json`. That snapshot is what makes
+deletions possible: without it, a memory present on only one side is ambiguous (created
+there, or deleted here?), and a two-way merge has to either resurrect deletions forever or
+lose new memories.
+
+| Situation | Result |
+| --- | --- |
+| Only on one side, never synced | Copied to the other |
+| Edited on one side | That version wins |
+| Edited on both since last sync | Newer `updated_at` wins, and the conflict is reported |
+| Deleted on one side, untouched on the other | Deletion propagates |
+| Deleted on one side, edited on the other | Survives — an edit outranks a stale delete |
+
+Two things are deliberately *not* treated as edits: `access_count` / `last_accessed`, which
+every recall bumps, and float noise in `importance`. Otherwise both sides would look
+permanently dirty and sync would never settle.
+
+Use `--direction push` or `pull` for one-way runs. Withheld changes are left out of the
+snapshot, so a later two-way sync still sees them as differences rather than assuming they
+converged.
+
+### Safety
+
+- Topic vectors are **not** sent; the receiving side recomputes them, so every vector stays
+  consistent with that store's own model. A sync aborts if the two sides embed with
+  different models.
+- The snapshot is written only after **both** sides apply cleanly, so an interrupted sync is
+  simply redone next time rather than losing data.
+- A partial read from the database raises instead of returning, because missing memories
+  would otherwise look like deletions and be propagated to the peer.
+
+### Manual plumbing
+
+`sync` drives these two on the far side; run them directly only when debugging:
+
+```bash
+bigbrain sync-dump --json    # this store's memories, human-readable
+bigbrain sync-apply          # apply a patch from stdin
+```
 
 ## Configuration (env vars)
 
@@ -235,5 +323,6 @@ candidates. Invoke it by asking the agent to "trim bigbrain memory".
 ## Tests
 
 ```bash
+uv run pytest                      # sync planner, export, installer (no Milvus or model needed)
 uv run python tests/mcp_smoke.py   # drives the MCP server over stdio
 ```

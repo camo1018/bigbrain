@@ -8,8 +8,7 @@
     ],
     "stop": [
       {
-        "command": "./hooks/bigbrain-maintenance.sh",
-        "loop_limit": 1
+        "command": "./hooks/bigbrain-maintenance.sh"
       }
     ]
   }

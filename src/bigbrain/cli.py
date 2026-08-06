@@ -18,15 +18,39 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from . import sync as sync_mod
 from .config import Config
 from .store import MemoryStore
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_HOOK_SCRIPTS = ("bigbrain-mark-substantive.sh", "bigbrain-maintenance.sh")
-_RULE_FILE = "bigbrain-memory.mdc"
+_HOOK_SCRIPTS = (
+    "bigbrain-mark-substantive.sh",
+    "bigbrain-maintenance.sh",
+    "bigbrain-maintenance-run.sh",
+)
+_RULE_SOURCE = "bigbrain-memory.mdc"
 _SKILLS_DIR = "skills"
 
 _REPO_PLACEHOLDER = "__BIGBRAIN_REPO__"
+
+# The two hosts take the same scripts but disagree on where config lives, how hook
+# entries nest, and what extension an auto-loaded rule needs.
+_TARGETS = {
+    "cursor": {
+        "config_dir": ".cursor",
+        "config_file": "hooks.json",
+        "template": "cursor/hooks.json.template",
+        "rule_file": "bigbrain-memory.mdc",
+        "reload_hint": "Reload Cursor (or it will hot-reload hooks.json) and approve the new hooks.",
+    },
+    "claude": {
+        "config_dir": ".claude",
+        "config_file": "settings.json",
+        "template": "claude/settings.json.template",
+        "rule_file": "bigbrain-memory.md",
+        "reload_hint": "Start a new Claude Code session so the hooks and rule load.",
+    },
+}
 
 _LAUNCHD_LABEL = "com.bigbrain.mcp"
 _PLIST_TEMPLATE = "com.bigbrain.mcp.plist.template"
@@ -188,6 +212,124 @@ def count() -> None:
     s.close()
 
 
+@app.command(name="sync-dump")
+def sync_dump(
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit readable JSON instead of the gzipped wire format."
+    ),
+) -> None:
+    """Emit this store's memories for a peer to reconcile against.
+
+    Writes the gzipped payload to stdout and nothing else, so a peer can invoke this
+    over ssh and read the result straight off the pipe.
+    """
+    cfg = Config.from_env()
+    s = MemoryStore(cfg)
+    try:
+        payload = sync_mod.make_dump(s.export_rows(), cfg)
+    finally:
+        s.close()
+
+    if as_json:
+        console.print_json(json.dumps(payload))
+        return
+    sys.stdout.buffer.write(sync_mod.encode_payload(payload))
+    sys.stdout.buffer.flush()
+
+
+@app.command(name="sync-apply")
+def sync_apply() -> None:
+    """Apply a sync patch read from stdin, printing a one-line JSON summary.
+
+    Invoked on the far side by `bigbrain sync`; rarely run by hand.
+    """
+    s = MemoryStore(Config.from_env())
+    try:
+        payload = sync_mod.decode_payload(sys.stdin.buffer.read())
+        summary = sync_mod.apply_patch(s, payload)
+    except sync_mod.SyncError as exc:
+        err_console.print(f"sync-apply failed: {exc}")
+        raise typer.Exit(1)
+    finally:
+        s.close()
+    sys.stdout.write(json.dumps(summary) + "\n")
+
+
+def _print_sync_report(report: "sync_mod.Report", *, dry_run: bool) -> None:
+    plan = report.plan
+    counts = plan.counts()
+    console.print(
+        f"[bold]local[/bold] {report.local_count} memories    "
+        f"[bold]{report.peer_host}[/bold] {report.peer_count} memories"
+    )
+
+    if plan.is_empty:
+        console.print("[green]already in sync[/green]")
+    else:
+        arrow = "would send" if dry_run else "sent"
+        console.print(
+            f"  {arrow} to peer   [green]{counts['to_peer']}[/green] memories, "
+            f"[red]{counts['delete_peer']}[/red] deletions"
+        )
+        console.print(
+            f"  {arrow} to local  [green]{counts['to_local']}[/green] memories, "
+            f"[red]{counts['delete_local']}[/red] deletions"
+        )
+
+    for note in plan.notes:
+        console.print(f"  [yellow]note[/yellow] {note}")
+    for conflict in plan.conflicts:
+        console.print(f"  [magenta]conflict[/magenta] {conflict}")
+    if counts["deferred"]:
+        console.print(
+            f"  [dim]{counts['deferred']} change(s) left alone by the direction filter[/dim]"
+        )
+
+    if dry_run:
+        console.print("[dim]dry run — nothing was written[/dim]")
+    elif not plan.is_empty:
+        console.print(f"[dim]state: {sync_mod.state_path(Config.from_env())}[/dim]")
+
+
+@app.command()
+def sync(
+    host: str = typer.Argument(..., help="ssh host of the peer, e.g. myhost or user@myhost."),
+    peer_cmd: str = typer.Option(
+        sync_mod.DEFAULT_PEER_COMMAND, "--peer-cmd", help="bigbrain entry point on the peer."
+    ),
+    name: Optional[str] = typer.Option(
+        None, "--name", help="Track this peer under this key (defaults to the host)."
+    ),
+    direction: str = typer.Option("both", "--direction", help="both | push | pull"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", "-n", help="Report what would change and write nothing."
+    ),
+) -> None:
+    """Reconcile this store with a peer's over ssh, in both directions.
+
+    Compares both sides against a snapshot of the last sync, so a memory only on one
+    side is correctly read as created there or deleted here. Deletions propagate,
+    and a memory edited on both sides keeps the newer version and is reported.
+    """
+    if direction not in ("both", "push", "pull"):
+        err_console.print("[red]--direction must be one of: both, push, pull[/red]")
+        raise typer.Exit(2)
+
+    peer = sync_mod.Peer(host=host, command=peer_cmd, key=name)
+    try:
+        report = sync_mod.run_sync(
+            lambda: MemoryStore(Config.from_env()),
+            peer,
+            direction=direction,  # type: ignore[arg-type]
+            dry_run=dry_run,
+        )
+    except sync_mod.SyncError as exc:
+        err_console.print(f"[red]sync failed:[/red] {exc}")
+        raise typer.Exit(1)
+
+    _print_sync_report(report, dry_run=dry_run)
+
+
 def _merge_hook_entries(existing: dict, template: dict) -> tuple[dict, list[str]]:
     """Merge template hook entries into an existing hooks.json dict, idempotently.
 
@@ -207,6 +349,29 @@ def _merge_hook_entries(existing: dict, template: dict) -> tuple[dict, list[str]
     return existing, added
 
 
+def _merge_claude_hook_entries(existing: dict, template: dict) -> tuple[dict, list[str]]:
+    """Merge template hook groups into a Claude Code settings.json dict, idempotently.
+
+    Claude nests hooks one level deeper than Cursor: each event holds matcher groups and
+    each group holds the actual entries. Dedup is on the inner `command`, so reinstalling
+    neither duplicates entries nor disturbs unrelated settings such as `permissions`.
+    """
+    hooks = existing.setdefault("hooks", {})
+    added: list[str] = []
+    for event, groups in template.get("hooks", {}).items():
+        bucket = hooks.setdefault(event, [])
+        present = {
+            entry.get("command") for group in bucket for entry in group.get("hooks", [])
+        }
+        for group in groups:
+            keep = [e for e in group.get("hooks", []) if e.get("command") not in present]
+            if not keep:
+                continue
+            bucket.append({**group, "hooks": keep})
+            added.extend(f"{event}: {e['command']}" for e in keep)
+    return existing, added
+
+
 def _stamp_repo_path(path: Path) -> None:
     """Resolve the repo-path placeholder in a script installed outside the checkout."""
     try:
@@ -217,19 +382,19 @@ def _stamp_repo_path(path: Path) -> None:
         path.write_text(text.replace(_REPO_PLACEHOLDER, str(_REPO_ROOT)))
 
 
-def _install_skills(cursor_dir: Path) -> list[str]:
-    """Copy bundled skills into ~/.cursor/skills/, preserving executable bits.
+def _install_skills(dest_root: Path) -> list[str]:
+    """Copy bundled skills into the host's skills dir, preserving executable bits.
 
-    Each `skills/<name>/` directory is mirrored under the user's Cursor skills
-    dir; script files keep their +x bit so the agent can run them directly.
-    Returns the names of the skills installed.
+    Each `skills/<name>/` directory is mirrored under the user's skills dir; script
+    files keep their +x bit so the agent can run them directly. Returns the names of
+    the skills installed.
     """
     src_root = _REPO_ROOT / _SKILLS_DIR
     if not src_root.is_dir():
         return []
     installed: list[str] = []
     for skill in sorted(p for p in src_root.iterdir() if p.is_dir()):
-        dest = cursor_dir / "skills" / skill.name
+        dest = dest_root / "skills" / skill.name
         shutil.copytree(skill, dest, dirs_exist_ok=True)
         for script in (dest / "scripts").glob("*"):
             if script.is_file():
@@ -241,10 +406,14 @@ def _install_skills(cursor_dir: Path) -> list[str]:
 
 @app.command(name="install-hooks")
 def install_hooks(
-    cursor_dir: Path = typer.Option(
-        Path.home() / ".cursor",
+    target: str = typer.Option(
+        "cursor", "--target", "-t", help="Agent host to install into: cursor or claude."
+    ),
+    config_dir: Optional[Path] = typer.Option(
+        None,
+        "--config-dir",
         "--cursor-dir",
-        help="Target Cursor config dir (user-level).",
+        help="Target config dir (defaults to ~/.cursor or ~/.claude).",
     ),
     with_rule: bool = typer.Option(
         True, "--with-rule/--no-rule", help="Also install the bigbrain memory rule."
@@ -253,17 +422,24 @@ def install_hooks(
         True, "--with-skills/--no-skills", help="Also install the bundled bigbrain skills."
     ),
 ) -> None:
-    """Install the memory-maintenance Cursor hooks (rule + skills) into ~/.cursor.
+    """Install the memory-maintenance hooks (rule + skills) for Cursor or Claude Code.
 
-    Copies the hook scripts, merges the hook entries into the user's hooks.json
-    (preserving any existing hooks), installs the agent memory rule, and installs
-    the bundled skills (e.g. bigbrain-trim). These are user-level so they apply
-    in every chat and repo.
+    Copies the hook scripts, merges the hook entries into the host's config file
+    (preserving anything already there), installs the agent memory rule, and installs
+    the bundled skills (e.g. bigbrain-trim). These are user-level so they apply in every
+    chat and repo. The same scripts serve both hosts; only the config layout differs.
     """
+    spec = _TARGETS.get(target)
+    if spec is None:
+        err_console.print(f"[red]--target must be one of: {', '.join(_TARGETS)}[/red]")
+        raise typer.Exit(2)
+
+    default_root = Path.home() / spec["config_dir"]
+    dest_root = config_dir or default_root
     src_hooks = _REPO_ROOT / "hooks"
-    template_path = src_hooks / "hooks.json.template"
+    template_path = src_hooks / spec["template"]
     if not template_path.exists():
-        err_console.print(f"[red]Cannot find bundled hooks at {src_hooks}[/red]")
+        err_console.print(f"[red]Cannot find bundled hooks at {template_path}[/red]")
         raise typer.Exit(1)
 
     if shutil.which("jq") is None:
@@ -272,7 +448,7 @@ def install_hooks(
             "require it at runtime. Install jq before relying on the hooks."
         )
 
-    dest_hooks = cursor_dir / "hooks"
+    dest_hooks = dest_root / "hooks"
     dest_hooks.mkdir(parents=True, exist_ok=True)
     for name in _HOOK_SCRIPTS:
         dst = dest_hooks / name
@@ -280,33 +456,43 @@ def install_hooks(
         os.chmod(dst, 0o755)
         console.print(f"[green]installed script[/green] {dst}")
 
-    template = json.loads(template_path.read_text())
-    hooks_json = cursor_dir / "hooks.json"
-    existing = json.loads(hooks_json.read_text()) if hooks_json.exists() else {}
-    if hooks_json.exists():
-        shutil.copyfile(hooks_json, hooks_json.with_suffix(".json.bak"))
-    merged, added = _merge_hook_entries(existing, template)
-    hooks_json.write_text(json.dumps(merged, indent=2) + "\n")
+    # The Claude template spells out an absolute hook path, so a non-default target dir
+    # has to be substituted in or the registered hooks would point at the wrong tree.
+    raw_template = template_path.read_text()
+    if dest_root != default_root:
+        raw_template = raw_template.replace(
+            f"$HOME/{spec['config_dir']}/hooks", str(dest_hooks)
+        )
+    template = json.loads(raw_template)
+
+    config_path = dest_root / spec["config_file"]
+    existing = json.loads(config_path.read_text()) if config_path.exists() else {}
+    if config_path.exists():
+        shutil.copyfile(config_path, config_path.with_suffix(".json.bak"))
+    merge = _merge_claude_hook_entries if target == "claude" else _merge_hook_entries
+    merged, added = merge(existing, template)
+    config_path.write_text(json.dumps(merged, indent=2) + "\n")
     if added:
-        console.print(f"[green]registered hooks[/green] in {hooks_json}: " + ", ".join(added))
+        console.print(f"[green]registered hooks[/green] in {config_path}: " + ", ".join(added))
     else:
-        console.print(f"[dim]hooks already registered[/dim] in {hooks_json}")
+        console.print(f"[dim]hooks already registered[/dim] in {config_path}")
 
     if with_rule:
-        src_rule = _REPO_ROOT / "rules" / _RULE_FILE
+        src_rule = _REPO_ROOT / "rules" / _RULE_SOURCE
         if src_rule.exists():
-            dest_rules = cursor_dir / "rules"
+            dest_rules = dest_root / "rules"
             dest_rules.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src_rule, dest_rules / _RULE_FILE)
-            console.print(f"[green]installed rule[/green] {dest_rules / _RULE_FILE}")
+            dest_rule = dest_rules / spec["rule_file"]
+            shutil.copyfile(src_rule, dest_rule)
+            console.print(f"[green]installed rule[/green] {dest_rule}")
         else:
             err_console.print(f"[yellow]rule not found at {src_rule}; skipped[/yellow]")
 
     if with_skills:
-        installed = _install_skills(cursor_dir)
+        installed = _install_skills(dest_root)
         if installed:
             console.print(
-                f"[green]installed skills[/green] in {cursor_dir / 'skills'}: "
+                f"[green]installed skills[/green] in {dest_root / 'skills'}: "
                 + ", ".join(installed)
             )
         else:
@@ -314,7 +500,7 @@ def install_hooks(
 
     console.print(
         "\n[bold]Next steps:[/bold]\n"
-        "  1. Reload Cursor (or it will hot-reload hooks.json) and approve the new hooks.\n"
+        f"  1. {spec['reload_hint']}\n"
         "  2. Ensure the bigbrain MCP server is registered (see README).\n"
         "  3. Start a new chat so the rule loads."
     )

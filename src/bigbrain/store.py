@@ -11,6 +11,7 @@ Design (brain-like):
 
 from __future__ import annotations
 
+import logging
 import math
 import secrets
 import time
@@ -314,6 +315,78 @@ class MemoryStore:
     def count(self) -> int:
         stats = self.client.get_collection_stats(self.config.collection)
         return int(stats.get("row_count", 0))
+
+    # -- replication ------------------------------------------------------
+
+    def export_rows(self, *, batch: int = 500) -> list[dict]:
+        """Every stored memory as a plain row, for syncing with another store.
+
+        The vector is left out: it is derived from the topic, so the receiving side
+        recomputes it with its own model instead of trusting ours.
+
+        Paging uses the query iterator rather than limit/offset because Milvus caps
+        the offset+limit window, which a store this is meant to grow would hit.
+        """
+        fields = list(Memory._PERSISTED_FIELDS)
+        # Keyed by primary key while iterating: without an mvcc timestamp to pin the
+        # read, the Milvus Lite iterator can hand back a row twice across a page
+        # boundary. Keying dedupes that at no cost.
+        by_id: dict[int, dict] = {}
+
+        # That same missing timestamp makes the iterator log a warning per page about
+        # falling back to a client-side one. It is expected, and would otherwise be
+        # the loudest thing a sync prints. Connect before muting: pymilvus reinstates
+        # its own logger level when a client is constructed, which would undo this.
+        client = self.client
+        logger = logging.getLogger("pymilvus")
+        previous = logger.level
+        logger.setLevel(max(previous, logging.ERROR))
+        try:
+            iterator = client.query_iterator(
+                collection_name=self.config.collection,
+                filter="id >= 0",
+                output_fields=fields,
+                batch_size=batch,
+            )
+            try:
+                while True:
+                    page = iterator.next()
+                    if not page:
+                        break
+                    for entity in page:
+                        by_id[int(entity["id"])] = {
+                            k: entity[k] for k in fields if k in entity
+                        }
+            finally:
+                iterator.close()
+        finally:
+            logger.setLevel(previous)
+
+        # A short export is dangerous rather than merely wrong: a sync compares this
+        # list against the peer's, so silently missing memories read as deletions and
+        # would be propagated. Fail loudly instead.
+        expected = self.count()
+        if len(by_id) < expected:
+            raise RuntimeError(
+                f"exported only {len(by_id)} of {expected} memories from "
+                f"{self.config.db_path}; refusing to hand back a partial export"
+            )
+        return list(by_id.values())
+
+    def import_rows(self, rows: list[dict]) -> int:
+        """Write rows from another store verbatim, keeping their ids and timestamps.
+
+        This deliberately bypasses store(): replication has to preserve identity and
+        history, where store() would mint a new id and dedup-merge the content.
+        """
+        if not rows:
+            return 0
+        payload = []
+        for row in rows:
+            mem = Memory.from_entity(row)
+            payload.append(mem.to_row(self._embedder.embed_one(mem.topic)))
+        self.client.upsert(self.config.collection, data=payload)
+        return len(payload)
 
     # -- helpers ----------------------------------------------------------
 

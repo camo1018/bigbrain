@@ -20,6 +20,14 @@ dependencies = [
 bigbrain = "bigbrain.cli:main"
 bigbrain-mcp = "bigbrain.mcp_server:main"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [build-system]
 requires = ["uv_build>=0.10.2,<0.11.0"]
 build-backend = "uv_build"

@@ -1,0 +1,29 @@
+; Linux counterpart to launchd/com.bigbrain.mcp.plist, for running the shared HTTP
+; server on a Linux host. Install as a systemd *user* unit:
+;
+;   mkdir -p ~/.config/systemd/user
+;   sed "s|__BIGBRAIN__|/path/to/bigbrain/.venv/bin/bigbrain|" \
+;     systemd/bigbrain.service.template > ~/.config/systemd/user/bigbrain.service
+;   systemctl --user daemon-reload
+;   systemctl --user enable --now bigbrain.service
+;
+; Then allow it to run without an active login session, otherwise it stops when you
+; disconnect:
+;
+;   loginctl enable-linger "$USER"
+;
+; Logs go to the journal: journalctl --user -u bigbrain -f
+
+[Unit]
+Description=bigbrain semantic memory MCP server
+After=network.target
+
+[Service]
+Type=simple
+Environment=BIGBRAIN_HOME=%h/.bigbrain
+ExecStart=__BIGBRAIN__ serve --host 127.0.0.1 --port 8765
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

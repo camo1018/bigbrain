@@ -1,22 +1,37 @@
 #!/bin/bash
-# Cursor `stop` hook. Fires at the end of each agent turn. Injects a bigbrain
-# memory-maintenance follow-up ONLY on the first stop after a real user message
-# (loop_count == 0) AND only when a per-conversation "dirty" marker exists (the
-# turn used >=1 tool, i.e. it did real work; pure conversational turns leave no
-# marker and are skipped). On the follow-up turn's own stop (loop_count >= 1) it
-# clears the marker and emits nothing, so the agent halts. This gates the pass to
-# at most once per substantive user message and cannot loop.
+# Stop hook (Cursor `stop`, Claude Code `Stop`). Hands the bigbrain memory-maintenance
+# pass to a detached background worker rather than continuing the turn, so the pass never
+# appears in the session transcript the user is reading.
+#
+# The pass runs only on the first stop after a real user message and only when a
+# per-session "dirty" marker exists, meaning the turn used at least one tool. Pure
+# conversational turns leave no marker and are skipped.
 set -euo pipefail
 
+# The worker drives its own headless agent session, which fires this same hook. Without
+# this guard every pass would spawn another one.
+if [[ -n "${BIGBRAIN_MAINT:-}" ]]; then
+  printf '{}'
+  exit 0
+fi
+
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
 input=$(cat)
-loop_count=$(printf '%s' "$input" | jq -r '.loop_count // 0')
-cid=$(printf '%s' "$input" | jq -r '.conversation_id // "global"' | tr -c 'A-Za-z0-9._-' '_')
+sid=$(printf '%s' "$input" | jq -r '.session_id // .conversation_id // "global"')
+sid=$(printf '%s' "$sid" | tr -c 'A-Za-z0-9._-' '_')
+
+# Claude Code reports an in-progress hook continuation as stop_hook_active; Cursor counts
+# them in loop_count. Either way a non-zero value means this stop is not a fresh turn.
+active=$(printf '%s' "$input" | jq -r '
+  if (.stop_hook_active // false) then "true"
+  elif ((.loop_count // 0) > 0) then "true"
+  else "false" end')
 
 dir="${TMPDIR:-/tmp}/bigbrain-hooks"
-marker="$dir/dirty-$cid"
+marker="$dir/dirty-$sid"
 
-# On the maintenance follow-up turn's stop, clear any marker it set and halt.
-if [[ "$loop_count" -ne 0 ]]; then
+if [[ "$active" == "true" ]]; then
   rm -f "$marker"
   printf '{}'
   exit 0
@@ -29,16 +44,19 @@ if [[ ! -f "$marker" ]]; then
 fi
 rm -f "$marker"
 
-jq -n '{
-  followup_message: (
-    "bigbrain memory-maintenance pass (auto-triggered). Review only what happened this turn. " +
-    "If a durable, reusable learning emerged (infra gotcha + fix, convention/decision + rationale, " +
-    "codebase/service map, or people/ownership), run the core loop from the bigbrain-memory rule: " +
-    "(1) memory_recall the topic first; (2) if a related entry exists, update it in place (re-store the " +
-    "same topic with on_conflict=replace \u2014 do NOT rely on memory_update by numeric id, and do not " +
-    "create a near-duplicate); (3) only memory_store fresh if nothing related exists. " +
-    "Skip secrets and one-off/transient details. If nothing durable emerged, reply exactly " +
-    "\"No memory update needed.\" and stop. Do not start any new work."
-  )
-}'
+mkdir -p "$dir"
+payload=$(mktemp "$dir/payload-$sid.XXXXXX")
+printf '%s' "$input" > "$payload"
+
+# Neither host has a non-blocking hook mode that also survives the session ending, so the
+# worker is detached and this hook returns immediately.
+if command -v setsid >/dev/null 2>&1; then
+  setsid "$here/bigbrain-maintenance-run.sh" "$payload" </dev/null >/dev/null 2>&1 &
+else
+  # macOS ships no setsid. Double-fork instead: the intermediate shell exits at once and
+  # the worker is reparented, so it outlives this hook and the session that spawned it.
+  ( nohup "$here/bigbrain-maintenance-run.sh" "$payload" </dev/null >/dev/null 2>&1 & ) &
+fi
+
+printf '{}'
 exit 0
