@@ -16,8 +16,9 @@ most relevant, fresh, and important knowledge surfaces first.
   (`BAAI/bge-small-en-v1.5`, 384-dim). No API key; offline after the one-time download.
   Vectors are unit-normalized and the store uses the inner-product metric, so the
   returned score is a cosine similarity in `[0, 1]`.
-- **One core library, two front-doors:** a CLI and an MCP server both wrap the same
-  `MemoryStore`.
+- **Host-independent core, two front-doors:** a CLI and an MCP server both wrap the
+  same `MemoryStore`. Bigbrain itself does not depend on Cursor, `cursor-agent`, or
+  Claude Code.
 
 ### What "rich" scope includes
 
@@ -70,6 +71,35 @@ The server exposes these tools: `memory_store`, `memory_recall`, `memory_get`,
 
 There are two ways to run it. **Prefer the shared HTTP server** (below) — it's the
 durable fix for the per-workbench spawn storm described in "Why a shared server".
+
+### Using bigbrain from different hosts
+
+The memory store and its automatic maintenance are separate layers:
+
+1. **Bigbrain service** — the host-independent store, available through the CLI or MCP.
+2. **Interactive client integration** — an agent calls the MCP tools while it works.
+3. **Automatic post-turn maintenance** — optional, host-specific hooks launch a headless
+   agent to decide what durable knowledge should be stored.
+
+Any MCP-capable application can use bigbrain by connecting to the shared endpoint:
+
+```text
+http://127.0.0.1:8765/mcp
+```
+
+Cursor is only one possible client. Claude Code can register the same HTTP endpoint with
+`claude mcp add`, and another MCP client can use its own server configuration. Applications
+without MCP support can invoke the `bigbrain` CLI or integrate the `MemoryStore` library
+directly.
+
+Neither `cursor-agent` nor `claude` is required to run the service, use the CLI, or call
+the MCP tools. They are required only by their respective optional background-maintenance
+integrations:
+
+- **Cursor hooks** launch `cursor-agent -p`.
+- **Claude Code hooks** launch `claude -p`.
+- **Another host** needs an equivalent hook or adapter if it should extract and store
+  memories automatically after a turn.
 
 ### Recommended: one shared HTTP server (macOS LaunchAgent)
 
@@ -139,14 +169,16 @@ claude mcp add --scope user --transport http bigbrain http://127.0.0.1:8765/mcp
 `--scope user` matters: the default is project-local, which would bind the server to
 whatever directory you happened to run the command from.
 
-## Agent memory rule (make recall/store automatic)
+## Agent memory rule (make recall consistent)
 
 What turns bigbrain from "a tool you invoke" into "memory that just works" is a **global
-Cursor rule** that tells the agent to recall at the start of a task and store durable
-learnings as it finishes — without being asked.
+agent rule that tells the agent to recall at the start of a task. Durable writes at the
+end of a turn are handled separately by the optional background-maintenance hooks below.
 
-- **Location:** `~/.cursor/rules/bigbrain-memory.mdc` (a user-level rule, so it applies in
-  **every chat and every repo**, not just this one).
+- **Cursor location:** `~/.cursor/rules/bigbrain-memory.mdc`
+- **Claude Code location:** `~/.claude/rules/bigbrain-memory.md`
+- Both are user-level rules, so they apply in **every chat and every repo**, not just
+  this one.
 - **Why `alwaysApply: true`:** the rule is loaded into every session automatically.
 - **When changes take effect:** rules load at chat start, so edits apply to **new chats**.
 
@@ -167,12 +199,9 @@ alwaysApply: true
 ## Recall at the start of a task
 Before non-trivial work, call `memory_recall` to check what is already known.
 
-## Store durable learnings as you finish
-After resolving something reusable, call `memory_store` with:
-- `topic`: short descriptive key (becomes the search embedding)
-- `content`: full, self-contained detail
-- `tags`: lowercase, reusable (e.g. `infra`, `conventions`, `gotcha`)
-- `importance`: 0.9–1.0 core, 0.5 default, <0.3 niche
+## Writing is handled off-session
+A background hook runs the maintenance pass after every substantive turn. Do not run
+the same maintenance loop inline unless the user explicitly asks to remember something.
 
 ## Don't
 - Don't store secrets, credentials, or tokens.
@@ -202,8 +231,9 @@ they read whichever field the host sends.
 - `hooks/bigbrain-maintenance.sh` — a `stop` / `Stop` hook that, when that marker is present,
   hands the pass to a detached background worker and returns immediately.
 - `hooks/bigbrain-maintenance-run.sh` — the worker. It reads the turn out of the session
-  transcript and runs a **headless agent session** (`claude -p` or `cursor-agent -p`) that does
-  the recall → decide → store/replace loop over the bigbrain MCP server.
+  transcript (including Cursor side chats nested under a parent session) and runs a
+  **headless agent session** (`claude -p` or `cursor-agent -p`) that does the recall → decide
+  → store/replace loop over the bigbrain MCP server.
 
 The pass runs entirely **outside** the session, so it never appears as a turn in the transcript
 you're reading, and the worker cleans up the headless session it creates. Every pass appends one
@@ -222,8 +252,59 @@ uv run bigbrain install-hooks --no-skills        # skip the bundled skills
 The installer copies the scripts to `<config>/hooks/`, **merges** the entries into the host's
 config (`~/.cursor/hooks.json` or `~/.claude/settings.json`, preserving anything already there
 and backing up alongside it), installs the rule to `<config>/rules/`, and installs the bundled
-skills to `<config>/skills/`. It's idempotent. The hook scripts require
-[`jq`](https://jqlang.github.io/jq/) on `PATH`.
+skills to `<config>/skills/`. It's idempotent.
+
+The hook scripts require [`jq`](https://jqlang.github.io/jq/) on `PATH`, plus the headless
+agent CLI for the selected host.
+
+### Installing Cursor Agent
+
+The `cursor` desktop CLI includes an `agent` subcommand that downloads Cursor Agent:
+
+```bash
+cursor agent
+```
+
+On macOS, this normally installs the executable at `~/.local/bin/cursor-agent`. If the
+installation succeeds but `command -v cursor-agent` prints nothing, add that directory to
+your shell `PATH` and start a new login shell:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+exec zsh -l
+
+command -v cursor-agent
+cursor-agent --help
+```
+
+The Bigbrain worker invokes `cursor-agent` directly, rather than `cursor agent`. GUI-launched
+hooks do not reliably inherit `.zshrc`, so the worker explicitly prepends `~/.local/bin` to
+its own `PATH`. Re-run `install-hooks` after updating Bigbrain so the installed worker has
+that behavior:
+
+```bash
+uv run bigbrain install-hooks
+```
+
+Then verify the next substantive turn in:
+
+```bash
+tail ~/.bigbrain/maintenance.log
+```
+
+A healthy pass ends with `ok`; `skipped: neither claude nor cursor-agent is on PATH`
+means the installed worker is stale or Cursor Agent is not under `~/.local/bin`.
+
+For Claude Code, verify its headless CLI separately:
+
+```bash
+command -v claude
+```
+
+Installing `cursor-agent` is a requirement of the **Cursor maintenance hooks**, not of
+bigbrain itself. If the relevant CLI is missing from the detached hook's `PATH`, the memory
+service and interactive MCP calls continue to work, but automatic post-turn updates are
+skipped. The reason is recorded in `~/.bigbrain/maintenance.log`.
 
 The worker is tunable through the environment: `BIGBRAIN_MAINT_MODEL` (defaults to `sonnet` on
 Claude Code, `composer-2.5` on Cursor — small models fail this task, answering in prose without

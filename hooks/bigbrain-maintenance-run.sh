@@ -18,6 +18,11 @@
 #   BIGBRAIN_MAINT_KEEP_SESSION  keep the headless session's artifacts (Cursor only)
 set -uo pipefail
 
+# Cursor Agent installs to ~/.local/bin on macOS, but GUI-launched hook processes do not
+# reliably inherit shell-profile PATH changes. Include the standard user binary directory
+# explicitly so the detached worker can resolve cursor-agent after installation.
+export PATH="$HOME/.local/bin:$PATH"
+
 payload_file="${1:?usage: bigbrain-maintenance-run.sh <payload-file>}"
 trap 'rm -f "$payload_file"' EXIT
 
@@ -90,10 +95,12 @@ else
   model="${BIGBRAIN_MAINT_MODEL:-composer-2.5}"
 fi
 
-# Cursor's stop payload may omit transcript_path; the transcript is still on disk under
-# the workspace-scoped projects tree, keyed by conversation id.
+# Cursor's stop payload may omit transcript_path. Main-chat transcripts are keyed by
+# conversation id; side chats live under their parent transcript's subagents directory.
 if [[ -z "$transcript" || ! -f "$transcript" ]]; then
-  for candidate in "$HOME/.cursor/projects"/*/agent-transcripts/"$sid/$sid.jsonl"; do
+  for candidate in \
+    "$HOME/.cursor/projects"/*/agent-transcripts/"$sid/$sid.jsonl" \
+    "$HOME/.cursor/projects"/*/agent-transcripts/*/subagents/"$sid.jsonl"; do
     [[ -f "$candidate" ]] && transcript="$candidate" && break
   done
 fi
