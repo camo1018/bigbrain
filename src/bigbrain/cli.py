@@ -27,28 +27,61 @@ _HOOK_SCRIPTS = (
     "bigbrain-mark-substantive.sh",
     "bigbrain-maintenance.sh",
     "bigbrain-maintenance-run.sh",
+    "bigbrain-maintenance-direct.mjs",
 )
+_DIRECT_RUNNER = "bigbrain-maintenance-direct.mjs"
+_PI_EXTENSION = "pi/bigbrain.ts"
 _RULE_SOURCE = "bigbrain-memory.mdc"
 _SKILLS_DIR = "skills"
+_MCP_URL = "http://127.0.0.1:8765/mcp"
 
 _REPO_PLACEHOLDER = "__BIGBRAIN_REPO__"
 
-# The two hosts take the same scripts but disagree on where config lives, how hook
-# entries nest, and what extension an auto-loaded rule needs.
+# Markers delimiting the bigbrain section the installer owns inside Pi's AGENTS.md, so a
+# reinstall replaces that section and leaves the rest of the file alone.
+_AGENTS_BEGIN = "<!-- bigbrain-memory:begin (managed by `bigbrain install-hooks`) -->"
+_AGENTS_END = "<!-- bigbrain-memory:end -->"
+
+# Cursor and Claude Code take the same hook scripts but disagree on where config lives,
+# how hook entries nest, and what extension an auto-loaded rule needs. Pi has no hook
+# config at all: an extension registers the tools and runs the pass, and the rule goes
+# into its global AGENTS.md.
 _TARGETS = {
     "cursor": {
         "config_dir": ".cursor",
         "config_file": "hooks.json",
         "template": "cursor/hooks.json.template",
         "rule_file": "bigbrain-memory.mdc",
+        "cli": "cursor-agent",
         "reload_hint": "Reload Cursor (or it will hot-reload hooks.json) and approve the new hooks.",
+        "mcp_hint": (
+            "Point Cursor at the server: `uv run bigbrain install-server` "
+            f"(or add {{\"url\": \"{_MCP_URL}\"}} to ~/.cursor/mcp.json)."
+        ),
     },
     "claude": {
         "config_dir": ".claude",
         "config_file": "settings.json",
         "template": "claude/settings.json.template",
         "rule_file": "bigbrain-memory.md",
+        "cli": "claude",
         "reload_hint": "Start a new Claude Code session so the hooks and rule load.",
+        "mcp_hint": (
+            "Register the server once, at user scope: "
+            f"`claude mcp add --scope user --transport http bigbrain {_MCP_URL}`"
+        ),
+    },
+    "pi": {
+        "config_dir": ".pi/agent",
+        "config_file": None,
+        "template": None,
+        "rule_file": "AGENTS.md",
+        "cli": None,
+        "reload_hint": "Run /reload in an open Pi session (or start a new one) to load the extension.",
+        "mcp_hint": (
+            f"Nothing to register: the extension talks to {_MCP_URL} directly. "
+            "Just keep the server running (`uv run bigbrain install-server` on macOS)."
+        ),
     },
 }
 
@@ -382,6 +415,53 @@ def _stamp_repo_path(path: Path) -> None:
         path.write_text(text.replace(_REPO_PLACEHOLDER, str(_REPO_ROOT)))
 
 
+def _rule_body() -> str:
+    """The memory rule's Markdown with its Cursor-specific YAML frontmatter stripped."""
+    text = (_REPO_ROOT / "rules" / _RULE_SOURCE).read_text()
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            text = text[end + len("\n---"):]
+    return text.strip() + "\n"
+
+
+def _merge_agents_md(path: Path, body: str) -> str:
+    """Write the rule into an AGENTS.md as a marked section; replace it if already there.
+
+    Returns "created", "updated", or "unchanged". Anything outside the markers is kept,
+    so users can hold their own instructions in the same file.
+    """
+    section = f"{_AGENTS_BEGIN}\n{body}{_AGENTS_END}\n"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(section)
+        return "created"
+
+    existing = path.read_text()
+    start = existing.find(_AGENTS_BEGIN)
+    end = existing.find(_AGENTS_END)
+    if start != -1 and end != -1 and end > start:
+        merged = existing[:start] + section + existing[end + len(_AGENTS_END):].lstrip("\n")
+    else:
+        merged = existing.rstrip("\n") + "\n\n" + section if existing.strip() else section
+    if merged == existing:
+        return "unchanged"
+    shutil.copyfile(path, path.with_suffix(".md.bak"))
+    path.write_text(merged)
+    return "updated"
+
+
+def _api_key_available() -> bool:
+    """Whether the direct runner would find an LLM key in the env or ~/.bigbrain/env."""
+    if os.environ.get("GEMINI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"):
+        return True
+    env_file = Path(os.environ.get("BIGBRAIN_ENV_FILE", Config.from_env().home / "env"))
+    if not env_file.is_file():
+        return False
+    text = env_file.read_text()
+    return "GEMINI_API_KEY=" in text or "ANTHROPIC_API_KEY=" in text
+
+
 def _install_skills(dest_root: Path) -> list[str]:
     """Copy bundled skills into the host's skills dir, preserving executable bits.
 
@@ -407,13 +487,13 @@ def _install_skills(dest_root: Path) -> list[str]:
 @app.command(name="install-hooks")
 def install_hooks(
     target: str = typer.Option(
-        "cursor", "--target", "-t", help="Agent host to install into: cursor or claude."
+        "cursor", "--target", "-t", help="Agent host to install into: cursor, claude, or pi."
     ),
     config_dir: Optional[Path] = typer.Option(
         None,
         "--config-dir",
         "--cursor-dir",
-        help="Target config dir (defaults to ~/.cursor or ~/.claude).",
+        help="Target config dir (defaults to ~/.cursor, ~/.claude, or ~/.pi/agent).",
     ),
     with_rule: bool = typer.Option(
         True, "--with-rule/--no-rule", help="Also install the bigbrain memory rule."
@@ -422,12 +502,17 @@ def install_hooks(
         True, "--with-skills/--no-skills", help="Also install the bundled bigbrain skills."
     ),
 ) -> None:
-    """Install the memory-maintenance hooks (rule + skills) for Cursor or Claude Code.
+    """Install the memory-maintenance hooks (rule + skills) for Cursor, Claude Code, or Pi.
 
-    Copies the hook scripts, merges the hook entries into the host's config file
-    (preserving anything already there), installs the agent memory rule, and installs
-    the bundled skills (e.g. bigbrain-trim). These are user-level so they apply in every
-    chat and repo. The same scripts serve both hosts; only the config layout differs.
+    Cursor / Claude Code: copies the hook scripts, merges the hook entries into the
+    host's config file (preserving anything already there), installs the agent memory
+    rule, and installs the bundled skills (e.g. bigbrain-trim).
+
+    Pi: installs the bigbrain extension (native memory tools + post-turn pass) and the
+    direct runner it launches, writes the rule into ~/.pi/agent/AGENTS.md as a managed
+    section, and installs the skills.
+
+    Everything is user-level, so it applies in every chat and repo.
     """
     spec = _TARGETS.get(target)
     if spec is None:
@@ -437,6 +522,50 @@ def install_hooks(
     default_root = Path.home() / spec["config_dir"]
     dest_root = config_dir or default_root
     src_hooks = _REPO_ROOT / "hooks"
+
+    if target == "pi":
+        _install_pi(dest_root, src_hooks)
+    else:
+        _install_hook_host(target, spec, dest_root, default_root, src_hooks)
+
+    if with_rule:
+        src_rule = _REPO_ROOT / "rules" / _RULE_SOURCE
+        if not src_rule.exists():
+            err_console.print(f"[yellow]rule not found at {src_rule}; skipped[/yellow]")
+        elif target == "pi":
+            agents_md = dest_root / spec["rule_file"]
+            outcome = _merge_agents_md(agents_md, _rule_body())
+            console.print(f"[green]{outcome} rule section[/green] in {agents_md}")
+        else:
+            dest_rules = dest_root / "rules"
+            dest_rules.mkdir(parents=True, exist_ok=True)
+            dest_rule = dest_rules / spec["rule_file"]
+            shutil.copyfile(src_rule, dest_rule)
+            console.print(f"[green]installed rule[/green] {dest_rule}")
+
+    if with_skills:
+        installed = _install_skills(dest_root)
+        if installed:
+            console.print(
+                f"[green]installed skills[/green] in {dest_root / 'skills'}: "
+                + ", ".join(installed)
+            )
+        else:
+            console.print("[dim]no bundled skills found; skipped[/dim]")
+
+    console.print(
+        "\n[bold]Next steps:[/bold]\n"
+        f"  1. {spec['reload_hint']}\n"
+        f"  2. {spec['mcp_hint']}\n"
+        "  3. Start a new chat so the rule loads, then check ~/.bigbrain/maintenance.log\n"
+        "     after the first turn that uses a tool."
+    )
+
+
+def _install_hook_host(
+    target: str, spec: dict, dest_root: Path, default_root: Path, src_hooks: Path
+) -> None:
+    """Cursor / Claude Code: copy the hook scripts and register them in the host config."""
     template_path = src_hooks / spec["template"]
     if not template_path.exists():
         err_console.print(f"[red]Cannot find bundled hooks at {template_path}[/red]")
@@ -446,6 +575,15 @@ def install_hooks(
         err_console.print(
             "[yellow]warning:[/yellow] `jq` not found on PATH — the hook scripts "
             "require it at runtime. Install jq before relying on the hooks."
+        )
+    if shutil.which(spec["cli"]) is None:
+        fallback_ok = shutil.which("node") is not None and _api_key_available()
+        status = "so the direct runner will handle the pass" if fallback_ok else (
+            "and the direct-runner fallback needs `node` plus GEMINI_API_KEY or "
+            "ANTHROPIC_API_KEY (in the environment or ~/.bigbrain/env)"
+        )
+        err_console.print(
+            f"[yellow]note:[/yellow] `{spec['cli']}` not found on PATH, {status}."
         )
 
     dest_hooks = dest_root / "hooks"
@@ -477,33 +615,39 @@ def install_hooks(
     else:
         console.print(f"[dim]hooks already registered[/dim] in {config_path}")
 
-    if with_rule:
-        src_rule = _REPO_ROOT / "rules" / _RULE_SOURCE
-        if src_rule.exists():
-            dest_rules = dest_root / "rules"
-            dest_rules.mkdir(parents=True, exist_ok=True)
-            dest_rule = dest_rules / spec["rule_file"]
-            shutil.copyfile(src_rule, dest_rule)
-            console.print(f"[green]installed rule[/green] {dest_rule}")
-        else:
-            err_console.print(f"[yellow]rule not found at {src_rule}; skipped[/yellow]")
 
-    if with_skills:
-        installed = _install_skills(dest_root)
-        if installed:
-            console.print(
-                f"[green]installed skills[/green] in {dest_root / 'skills'}: "
-                + ", ".join(installed)
-            )
-        else:
-            console.print("[dim]no bundled skills found; skipped[/dim]")
+def _install_pi(dest_root: Path, src_hooks: Path) -> None:
+    """Pi: install the extension and the direct runner it spawns.
 
-    console.print(
-        "\n[bold]Next steps:[/bold]\n"
-        f"  1. {spec['reload_hint']}\n"
-        "  2. Ensure the bigbrain MCP server is registered (see README).\n"
-        "  3. Start a new chat so the rule loads."
-    )
+    Pi auto-discovers `extensions/*.ts`; the runner lives under `hooks/` so Pi does not
+    try to load it as an extension. The extension looks for the runner there first and
+    falls back to the stamped checkout path.
+    """
+    if shutil.which("node") is None:
+        err_console.print(
+            "[yellow]warning:[/yellow] `node` not found on PATH — the Pi maintenance "
+            "pass runs on Node.js (Pi itself needs it too)."
+        )
+    if not _api_key_available():
+        err_console.print(
+            "[yellow]note:[/yellow] no GEMINI_API_KEY or ANTHROPIC_API_KEY found. The "
+            "maintenance pass calls an LLM API directly; put the key in the environment "
+            "Pi runs in or in ~/.bigbrain/env (KEY=VALUE)."
+        )
+
+    dest_hooks = dest_root / "hooks"
+    dest_hooks.mkdir(parents=True, exist_ok=True)
+    runner = dest_hooks / _DIRECT_RUNNER
+    shutil.copyfile(src_hooks / _DIRECT_RUNNER, runner)
+    os.chmod(runner, 0o755)
+    console.print(f"[green]installed script[/green] {runner}")
+
+    dest_ext = dest_root / "extensions"
+    dest_ext.mkdir(parents=True, exist_ok=True)
+    extension = dest_ext / Path(_PI_EXTENSION).name
+    shutil.copyfile(src_hooks / _PI_EXTENSION, extension)
+    _stamp_repo_path(extension)
+    console.print(f"[green]installed extension[/green] {extension}")
 
 
 @app.command()
@@ -647,11 +791,21 @@ def install_server(
     mcp_json = _set_mcp_server_entry(cursor_dir, {"url": url})
     console.print(f"[green]pointed Cursor at[/green] {url} (in {mcp_json})")
 
+    steps = [
+        "Reload Cursor (or toggle the bigbrain MCP server off/on) to pick up the URL.",
+        "The server now starts on login and respawns automatically.",
+        f"Logs: {logs_dir / 'server.err.log'}",
+    ]
+    if shutil.which("claude"):
+        steps.append(
+            "Claude Code: `claude mcp add --scope user --transport http bigbrain "
+            f"{url}` (once)."
+        )
+    if shutil.which("pi"):
+        steps.append("Pi: nothing to register; `bigbrain install-hooks --target pi` installs the bridge.")
     console.print(
         "\n[bold]Next steps:[/bold]\n"
-        "  1. Reload Cursor (or toggle the bigbrain MCP server off/on) to pick up the URL.\n"
-        "  2. The server now starts on login and respawns automatically.\n"
-        f"  3. Logs: {logs_dir / 'server.err.log'}"
+        + "\n".join(f"  {i}. {s}" for i, s in enumerate(steps, 1))
     )
 
 

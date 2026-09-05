@@ -16,6 +16,11 @@
 #   BIGBRAIN_MCP_URL          bigbrain MCP endpoint             (default: http://127.0.0.1:8765/mcp)
 #   BIGBRAIN_MAINT_DRYRUN     print the assembled prompt and exit without running it
 #   BIGBRAIN_MAINT_KEEP_SESSION  keep the headless session's artifacts (Cursor only)
+#   BIGBRAIN_MAINT_HOST       force the runner: claude | cursor | direct
+#   BIGBRAIN_ENV_FILE         KEY=VALUE file read for missing API keys (default: ~/.bigbrain/env)
+#
+# When neither `claude` nor `cursor-agent` is installed, the pass falls back to
+# bigbrain-maintenance-direct.mjs (Node + GEMINI_API_KEY or ANTHROPIC_API_KEY).
 set -uo pipefail
 
 # Cursor Agent installs to ~/.local/bin on macOS, but GUI-launched hook processes do not
@@ -73,15 +78,50 @@ else
   host=claude
 fi
 
+# Hooks launched by a GUI application inherit no shell profile, so API keys for the direct
+# runner are also read from a KEY=VALUE file. Only variables not already set are filled in.
+env_file="${BIGBRAIN_ENV_FILE:-$HOME/.bigbrain/env}"
+if [[ -f "$env_file" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    line="${line#export }"
+    key="${line%%=*}"
+    value="${line#*=}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value%\"}"; value="${value#\"}"; value="${value%\'}"; value="${value#\'}"
+    [[ -z "${!key:-}" ]] && export "$key=$value"
+  done < "$env_file"
+fi
+
 # Fall back to whichever CLI is actually installed rather than failing with "command
-# not found" in a detached process nobody is watching.
-if ! command -v "$([[ $host == claude ]] && echo claude || echo cursor-agent)" >/dev/null 2>&1; then
+# not found" in a detached process nobody is watching. With neither CLI present, the
+# standalone direct runner takes over if Node and an API key are available.
+direct_script="$(dirname "$0")/bigbrain-maintenance-direct.mjs"
+direct_ok=0
+if command -v node >/dev/null 2>&1 && [[ -f "$direct_script" ]] \
+   && [[ -n "${GEMINI_API_KEY:-}" || -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  direct_ok=1
+fi
+
+if [[ -n "${BIGBRAIN_MAINT_HOST:-}" ]]; then
+  host="$BIGBRAIN_MAINT_HOST"
+fi
+
+if [[ "$host" == direct ]]; then
+  if (( ! direct_ok )); then
+    note "session=$sid skipped: BIGBRAIN_MAINT_HOST=direct but node, the runner, or an API key is missing"
+    exit 0
+  fi
+elif ! command -v "$([[ $host == claude ]] && echo claude || echo cursor-agent)" >/dev/null 2>&1; then
   if [[ "$host" == claude ]] && command -v cursor-agent >/dev/null 2>&1; then
     host=cursor
   elif [[ "$host" == cursor ]] && command -v claude >/dev/null 2>&1; then
     host=claude
+  elif (( direct_ok )); then
+    host=direct
   else
-    note "session=$sid skipped: neither claude nor cursor-agent is on PATH"
+    note "session=$sid skipped: neither claude nor cursor-agent is on PATH, and the direct runner needs node plus GEMINI_API_KEY or ANTHROPIC_API_KEY (env or $env_file)"
     exit 0
   fi
 fi
@@ -205,6 +245,13 @@ allowed_claude="mcp__bigbrain__memory_recall,mcp__bigbrain__memory_store,mcp__bi
 # Both hosts fire these same hooks from the headless session; the guard stops the pass
 # from spawning another pass.
 export BIGBRAIN_MAINT=1
+
+if [[ "$host" == direct ]]; then
+  direct_payload="$(mktemp "${TMPDIR:-/tmp}/bigbrain-direct-XXXXXX.json")"
+  jq -n --arg sid "$sid" --arg turn "$turn" '{session_id: $sid, turn_text: $turn}' > "$direct_payload"
+  node "$direct_script" "$direct_payload"
+  exit $?
+fi
 
 started=$(date +%s)
 if [[ "$host" == claude ]]; then

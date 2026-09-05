@@ -48,6 +48,49 @@ uv run bigbrain setup   # download + cache the embedding model (one-time)
 > `src/bigbrain/_bootstrap.py`); point `SSL_CERT_FILE` at the CA bundle to avoid that.
 > Normal runtime does no network I/O.
 
+## Quick start per host
+
+Every host uses the same three layers: the shared HTTP server, an MCP (or bridged) client
+so the agent can call `memory_*` tools, and an optional post-turn maintenance pass. Run
+the server step once per machine, then the block for each agent you use.
+
+**Server (once per machine)**
+
+```bash
+uv run bigbrain install-server        # macOS: LaunchAgent on 127.0.0.1:8765, starts on login
+# Linux: see systemd/bigbrain.service.template (steps in its header)
+```
+
+**Cursor**
+
+```bash
+uv run bigbrain install-hooks         # hooks + rule + skills → ~/.cursor
+cursor agent                          # installs cursor-agent, used by the maintenance pass
+```
+
+`install-server` already pointed `~/.cursor/mcp.json` at the server. Reload Cursor.
+
+**Claude Code**
+
+```bash
+claude mcp add --scope user --transport http bigbrain http://127.0.0.1:8765/mcp
+uv run bigbrain install-hooks --target claude    # hooks + rule + skills → ~/.claude
+```
+
+**Pi coding agent**
+
+```bash
+uv run bigbrain install-hooks --target pi        # extension + runner + AGENTS.md section + skills → ~/.pi/agent
+```
+
+Pi has no MCP client, so the installed extension registers the `memory_*` tools natively
+and runs the maintenance pass through the direct runner, which needs `node` and a
+`GEMINI_API_KEY` or `ANTHROPIC_API_KEY` (in Pi's environment or in `~/.bigbrain/env`).
+Run `/reload` in an open Pi session, or start a new one.
+
+**Verify**: start a new chat, do one turn that uses a tool, then `tail ~/.bigbrain/maintenance.log`.
+A healthy line ends in `ok … :: NOOP` or `:: STORED <topic>`; a `skipped:` line names what is missing.
+
 ## CLI usage
 
 ```bash
@@ -79,7 +122,7 @@ The memory store and its automatic maintenance are separate layers:
 1. **Bigbrain service** — the host-independent store, available through the CLI or MCP.
 2. **Interactive client integration** — an agent calls the MCP tools while it works.
 3. **Automatic post-turn maintenance** — optional, host-specific hooks launch a headless
-   agent to decide what durable knowledge should be stored.
+   agent or direct runner to decide what durable knowledge should be stored.
 
 Any MCP-capable application can use bigbrain by connecting to the shared endpoint:
 
@@ -87,19 +130,21 @@ Any MCP-capable application can use bigbrain by connecting to the shared endpoin
 http://127.0.0.1:8765/mcp
 ```
 
-Cursor is only one possible client. Claude Code can register the same HTTP endpoint with
-`claude mcp add`, and another MCP client can use its own server configuration. Applications
-without MCP support can invoke the `bigbrain` CLI or integrate the `MemoryStore` library
-directly.
+- **Cursor** connects via `mcp.json` (`install-server` writes the entry).
+- **Claude Code** registers via `claude mcp add --scope user --transport http bigbrain http://127.0.0.1:8765/mcp`.
+- **Pi coding agent** has no MCP client; `install-hooks --target pi` installs a TypeScript
+  extension ([`hooks/pi/bigbrain.ts`](hooks/pi/bigbrain.ts)) that registers native
+  `memory_*` tools and forwards each call to the endpoint.
 
 Neither `cursor-agent` nor `claude` is required to run the service, use the CLI, or call
-the MCP tools. They are required only by their respective optional background-maintenance
-integrations:
-
+the MCP tools. For the automatic background-maintenance pass:
 - **Cursor hooks** launch `cursor-agent -p`.
 - **Claude Code hooks** launch `claude -p`.
-- **Another host** needs an equivalent hook or adapter if it should extract and store
-  memories automatically after a turn.
+- **Pi** runs the direct runner on `agent_settled`.
+- **Direct runner** (`hooks/bigbrain-maintenance-direct.mjs`) is a standalone Node.js
+  script that calls Gemini or Anthropic directly and drives the memory tools over HTTP. It
+  is what Pi uses, and what the Cursor / Claude Code worker falls back to when the host's
+  CLI is not installed.
 
 ### Recommended: one shared HTTP server (macOS LaunchAgent)
 
@@ -172,21 +217,26 @@ whatever directory you happened to run the command from.
 ## Agent memory rule (make recall consistent)
 
 What turns bigbrain from "a tool you invoke" into "memory that just works" is a **global
-agent rule that tells the agent to recall at the start of a task. Durable writes at the
+agent rule** that tells the agent to recall at the start of a task. Durable writes at the
 end of a turn are handled separately by the optional background-maintenance hooks below.
 
-- **Cursor location:** `~/.cursor/rules/bigbrain-memory.mdc`
-- **Claude Code location:** `~/.claude/rules/bigbrain-memory.md`
-- Both are user-level rules, so they apply in **every chat and every repo**, not just
-  this one.
-- **Why `alwaysApply: true`:** the rule is loaded into every session automatically.
-- **When changes take effect:** rules load at chat start, so edits apply to **new chats**.
+The single source is [`rules/bigbrain-memory.mdc`](rules/bigbrain-memory.mdc); `install-hooks`
+places it where each host auto-loads user-level instructions:
+
+- **Cursor:** `~/.cursor/rules/bigbrain-memory.mdc` (as is; `alwaysApply: true`)
+- **Claude Code:** `~/.claude/rules/bigbrain-memory.md` (as is; `~/.claude/rules/*.md` loads every session)
+- **Pi:** a managed section inside `~/.pi/agent/AGENTS.md`, frontmatter stripped, between
+  `<!-- bigbrain-memory:begin -->` / `<!-- bigbrain-memory:end -->` markers. Anything you keep
+  outside the markers is preserved on reinstall.
+- All are user-level, so they apply in **every chat and every repo**, not just this one.
+- **When changes take effect:** rules load at session start, so edits apply to **new chats**.
 
 ### How to add to / edit the rule
 
 It's a plain `.mdc` file: YAML frontmatter followed by Markdown instructions. Edit it to
 change what the agent recalls/stores, add tag conventions, tune the importance scale, or
-add do/don't guidance. Keep it concise (aim for < 50 lines) and actionable.
+add do/don't guidance. Keep it concise (aim for < 50 lines) and actionable. Re-run
+`install-hooks` for each host afterwards.
 
 ```markdown
 ---
@@ -221,19 +271,25 @@ After editing, start a new chat to pick up the changes. You can confirm what's s
 ## Memory-maintenance hooks (auto-run the recall/store loop)
 
 The rule tells the agent *what* to do; **hooks** make sure it actually happens. This repo
-ships three scripts that run a memory-maintenance pass after every **substantive** turn (any
-turn that used a tool — pure conversational turns are skipped). The same scripts work on both
-[Cursor](https://cursor.com/docs/hooks) and [Claude Code](https://code.claude.com/docs/en/hooks);
-they read whichever field the host sends.
+ships scripts that run a memory-maintenance pass after every **substantive** turn (any
+turn that used a tool — pure conversational turns are skipped).
 
-- `hooks/bigbrain-mark-substantive.sh` — a `postToolUse` / `PostToolUse` hook that drops a
-  per-session marker whenever a tool runs.
-- `hooks/bigbrain-maintenance.sh` — a `stop` / `Stop` hook that, when that marker is present,
-  hands the pass to a detached background worker and returns immediately.
-- `hooks/bigbrain-maintenance-run.sh` — the worker. It reads the turn out of the session
-  transcript (including Cursor side chats nested under a parent session) and runs a
-  **headless agent session** (`claude -p` or `cursor-agent -p`) that does the recall → decide
-  → store/replace loop over the bigbrain MCP server.
+- `hooks/bigbrain-mark-substantive.sh` — a `postToolUse` / `PostToolUse` hook (Cursor / Claude)
+  that drops a per-session marker whenever a tool runs.
+- `hooks/bigbrain-maintenance.sh` — a `stop` / `Stop` hook (Cursor / Claude) that, when that
+  marker is present, hands the pass to a detached background worker and returns immediately.
+- `hooks/bigbrain-maintenance-run.sh` — the background worker for Claude Code (`claude -p`)
+  and Cursor (`cursor-agent -p`). It reads the turn out of the session transcript (including
+  Cursor side chats nested under a parent session) and runs a headless agent session to execute
+  the recall → decide → store/replace loop over the bigbrain MCP server. If the host's CLI is
+  not on `PATH` it uses whichever one is, and failing both, the direct runner.
+- `hooks/bigbrain-maintenance-direct.mjs` — the standalone direct runner (Node.js ≥ 18, no
+  packages). It calls the LLM API directly — Gemini with `GEMINI_API_KEY` (default model
+  `gemini-3.7-flash`) or Anthropic with `ANTHROPIC_API_KEY` (default `claude-sonnet-5`) — and
+  executes the model's `memory_recall` / `memory_store` calls against the MCP endpoint over
+  plain HTTP. Pi uses it for every pass; Cursor and Claude Code use it as the fallback.
+- `hooks/pi/bigbrain.ts` — the Pi extension. Registers the seven `memory_*` tools natively and,
+  on `agent_settled`, renders the finished turn and spawns the direct runner detached.
 
 The pass runs entirely **outside** the session, so it never appears as a turn in the transcript
 you're reading, and the worker cleans up the headless session it creates. Every pass appends one
@@ -245,17 +301,36 @@ Because bigbrain memory is cross-repo, these install at the **user level**, not 
 ```bash
 uv run bigbrain install-hooks                    # Cursor (default) → ~/.cursor
 uv run bigbrain install-hooks --target claude    # Claude Code → ~/.claude
+uv run bigbrain install-hooks --target pi        # Pi → ~/.pi/agent
 uv run bigbrain install-hooks --no-rule          # hooks only
 uv run bigbrain install-hooks --no-skills        # skip the bundled skills
 ```
 
-The installer copies the scripts to `<config>/hooks/`, **merges** the entries into the host's
-config (`~/.cursor/hooks.json` or `~/.claude/settings.json`, preserving anything already there
-and backing up alongside it), installs the rule to `<config>/rules/`, and installs the bundled
-skills to `<config>/skills/`. It's idempotent.
+For Cursor and Claude Code the installer copies the scripts to `<config>/hooks/`, **merges**
+the entries into the host's config (`~/.cursor/hooks.json` or `~/.claude/settings.json`,
+preserving anything already there and backing up alongside it), installs the rule to
+`<config>/rules/`, and installs the bundled skills to `<config>/skills/`. For Pi it copies the
+extension to `~/.pi/agent/extensions/`, the direct runner to `~/.pi/agent/hooks/`, writes the
+rule into `~/.pi/agent/AGENTS.md` as a managed section, and installs the skills to
+`~/.pi/agent/skills/`. All of it is idempotent, and the installer warns about anything the
+pass will need at runtime that it cannot find (`jq`, the host CLI, `node`, an API key).
 
 The hook scripts require [`jq`](https://jqlang.github.io/jq/) on `PATH`, plus the headless
-agent CLI for the selected host.
+agent CLI for the selected host — or, without one, `node` and an API key for the direct runner.
+
+#### API keys for the direct runner
+
+Hooks launched by a GUI application (Cursor started from the Dock, for instance) inherit no
+shell profile, so a key exported in `.zshrc` never reaches them. The worker and the runner
+therefore also read `~/.bigbrain/env`, a plain `KEY=VALUE` file (comments and `export` prefixes
+are fine), filling in only variables that are not already set:
+
+```bash
+mkdir -p ~/.bigbrain && chmod 700 ~/.bigbrain
+echo 'GEMINI_API_KEY=...' >> ~/.bigbrain/env && chmod 600 ~/.bigbrain/env
+```
+
+Gemini is picked when both keys are present; force one with `BIGBRAIN_MAINT_PROVIDER=gemini|anthropic`.
 
 ### Installing Cursor Agent
 
@@ -292,8 +367,9 @@ Then verify the next substantive turn in:
 tail ~/.bigbrain/maintenance.log
 ```
 
-A healthy pass ends with `ok`; `skipped: neither claude nor cursor-agent is on PATH`
-means the installed worker is stale or Cursor Agent is not under `~/.local/bin`.
+A healthy pass ends with `ok`; a `skipped: neither claude nor cursor-agent is on PATH …`
+line means the installed worker is stale, Cursor Agent is not under `~/.local/bin`, and
+no direct-runner key was found either.
 
 For Claude Code, verify its headless CLI separately:
 
@@ -308,9 +384,12 @@ skipped. The reason is recorded in `~/.bigbrain/maintenance.log`.
 
 The worker is tunable through the environment: `BIGBRAIN_MAINT_MODEL` (defaults to `sonnet` on
 Claude Code, `composer-2.5` on Cursor — small models fail this task, answering in prose without
-calling the tools), `BIGBRAIN_MAINT_TIMEOUT`, `BIGBRAIN_MAINT_LOG`, `BIGBRAIN_MAINT_MAX_CHARS`,
-and `BIGBRAIN_MCP_URL`. Set `BIGBRAIN_MAINT_DRYRUN=1` to print the assembled prompt instead of
-running the pass.
+calling the tools), `BIGBRAIN_MAINT_DIRECT_MODEL` (the direct runner's model, kept separate
+because the host CLIs and the raw APIs share no model ids), `BIGBRAIN_MAINT_HOST` (force
+`claude`, `cursor`, or `direct`), `BIGBRAIN_MAINT_TIMEOUT`, `BIGBRAIN_MAINT_LOG`,
+`BIGBRAIN_MAINT_MAX_CHARS`, `BIGBRAIN_MCP_URL`, and `BIGBRAIN_ENV_FILE`. Set
+`BIGBRAIN_MAINT_DRYRUN=1` to print the assembled prompt instead of running the pass; it works
+on the worker and on the direct runner alike.
 
 ## Trimming memory (`bigbrain-trim` skill)
 

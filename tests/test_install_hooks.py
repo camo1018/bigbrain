@@ -2,6 +2,8 @@
 
 The same hook scripts serve Cursor and Claude Code, but the two hosts disagree on
 where config lives and how deeply hook entries nest, so most cases run against both.
+Pi takes a different shape entirely (extension + AGENTS.md section) and has its own
+cases at the bottom.
 """
 
 from __future__ import annotations
@@ -14,7 +16,15 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from bigbrain.cli import _HOOK_SCRIPTS, _TARGETS, app
+from bigbrain.cli import (
+    _AGENTS_BEGIN,
+    _AGENTS_END,
+    _DIRECT_RUNNER,
+    _HOOK_SCRIPTS,
+    _REPO_PLACEHOLDER,
+    _TARGETS,
+    app,
+)
 
 runner = CliRunner()
 
@@ -125,3 +135,71 @@ def test_unknown_target_is_rejected(tmp_path):
         app, ["install-hooks", "--target", "emacs", "--config-dir", str(tmp_path)]
     )
     assert result.exit_code == 2
+
+
+# --- Pi -----------------------------------------------------------------------------
+
+
+def agents_section(text: str) -> str:
+    start, end = text.find(_AGENTS_BEGIN), text.find(_AGENTS_END)
+    assert start != -1 and end > start, "managed section missing"
+    return text[start : end + len(_AGENTS_END)]
+
+
+def test_pi_installs_extension_runner_agents_and_skills(tmp_path):
+    install(tmp_path, "pi")
+
+    extension = tmp_path / "extensions" / "bigbrain.ts"
+    assert extension.is_file()
+    runner_script = tmp_path / "hooks" / _DIRECT_RUNNER
+    assert runner_script.is_file()
+    assert os.stat(runner_script).st_mode & stat.S_IXUSR
+    # Only the extension may live under extensions/: Pi loads everything there.
+    assert [p.name for p in (tmp_path / "extensions").iterdir()] == ["bigbrain.ts"]
+
+    body = agents_section((tmp_path / "AGENTS.md").read_text())
+    assert "memory_recall" in body
+    assert "alwaysApply" not in body, "Cursor frontmatter leaked into AGENTS.md"
+
+    assert (tmp_path / "skills" / "bigbrain-trim" / "SKILL.md").is_file()
+
+
+def test_pi_extension_has_repo_path_stamped(tmp_path):
+    install(tmp_path, "pi")
+    text = (tmp_path / "extensions" / "bigbrain.ts").read_text()
+    assert _REPO_PLACEHOLDER not in text
+    assert str(Path(__file__).resolve().parents[1]) in text
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        None,
+        "# My instructions\n\nAlways answer in haiku.\n",
+        f"# Mine\n\n{_AGENTS_BEGIN}\nstale bigbrain text\n{_AGENTS_END}\n\n# More of mine\n",
+    ],
+    ids=["no-file", "unrelated-content", "stale-section"],
+)
+def test_pi_agents_md_merge_preserves_content_and_is_idempotent(tmp_path, existing):
+    agents_md = tmp_path / "AGENTS.md"
+    if existing is not None:
+        agents_md.write_text(existing)
+
+    install(tmp_path, "pi")
+    first = agents_md.read_text()
+    assert first.count(_AGENTS_BEGIN) == 1
+    assert "stale bigbrain text" not in first
+    if existing:
+        for line in existing.splitlines():
+            if line.startswith("#") and "bigbrain" not in line:
+                assert line in first, f"user content dropped: {line!r}"
+
+    install(tmp_path, "pi")
+    assert agents_md.read_text() == first
+
+
+def test_pi_opt_out_flags(tmp_path):
+    install(tmp_path, "pi", "--no-rule", "--no-skills")
+    assert not (tmp_path / "AGENTS.md").exists()
+    assert not (tmp_path / "skills").exists()
+    assert (tmp_path / "extensions" / "bigbrain.ts").is_file()
