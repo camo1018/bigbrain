@@ -20,7 +20,9 @@
 #   BIGBRAIN_ENV_FILE         KEY=VALUE file read for missing API keys (default: ~/.bigbrain/env)
 #
 # When neither `claude` nor `cursor-agent` is installed, the pass falls back to
-# bigbrain-maintenance-direct.mjs (Node + GEMINI_API_KEY or ANTHROPIC_API_KEY).
+# bigbrain-maintenance-direct.mjs, which drives a headless Pi (when `pi` and the bigbrain
+# Pi extension are installed) or calls Gemini / Anthropic with GEMINI_API_KEY or
+# ANTHROPIC_API_KEY.
 set -uo pipefail
 
 # Cursor Agent installs to ~/.local/bin on macOS, but GUI-launched hook processes do not
@@ -100,7 +102,9 @@ fi
 direct_script="$(dirname "$0")/bigbrain-maintenance-direct.mjs"
 direct_ok=0
 if command -v node >/dev/null 2>&1 && [[ -f "$direct_script" ]] \
-   && [[ -n "${GEMINI_API_KEY:-}" || -n "${ANTHROPIC_API_KEY:-}" ]]; then
+   && { [[ -n "${GEMINI_API_KEY:-}" || -n "${ANTHROPIC_API_KEY:-}" ]] \
+        || { command -v pi >/dev/null 2>&1 \
+             && [[ -f "${BIGBRAIN_MAINT_PI_EXTENSION:-$HOME/.pi/agent/extensions/bigbrain.ts}" ]]; }; }; then
   direct_ok=1
 fi
 
@@ -110,7 +114,7 @@ fi
 
 if [[ "$host" == direct ]]; then
   if (( ! direct_ok )); then
-    note "session=$sid skipped: BIGBRAIN_MAINT_HOST=direct but node, the runner, or an API key is missing"
+    note "session=$sid skipped: BIGBRAIN_MAINT_HOST=direct but node, the runner, or a model (pi + bigbrain extension, or an API key) is missing"
     exit 0
   fi
 elif ! command -v "$([[ $host == claude ]] && echo claude || echo cursor-agent)" >/dev/null 2>&1; then
@@ -121,7 +125,7 @@ elif ! command -v "$([[ $host == claude ]] && echo claude || echo cursor-agent)"
   elif (( direct_ok )); then
     host=direct
   else
-    note "session=$sid skipped: neither claude nor cursor-agent is on PATH, and the direct runner needs node plus GEMINI_API_KEY or ANTHROPIC_API_KEY (env or $env_file)"
+    note "session=$sid skipped: neither claude nor cursor-agent is on PATH, and the direct runner needs node plus either pi with the bigbrain extension or GEMINI_API_KEY / ANTHROPIC_API_KEY (env or $env_file)"
     exit 0
   fi
 fi

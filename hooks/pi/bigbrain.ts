@@ -3,7 +3,9 @@
 // Pi has no MCP client, so this registers the bigbrain memory tools natively and bridges
 // each call to the shared HTTP server. It also runs the post-turn memory-maintenance pass:
 // on `agent_settled` it renders the turn that just ended and hands it to the standalone
-// direct runner, detached, so the pass never appears in the session.
+// direct runner, detached, so the pass never appears in the session. The runner performs
+// the pass with a headless `pi -p` that loads only this extension, so it uses the same
+// providers and credentials as this Pi and needs no separate API key.
 //
 // Installed by `bigbrain install-hooks --target pi`, which also places the direct runner
 // under ~/.pi/agent/hooks/ and stamps the repo path below.
@@ -19,6 +21,7 @@ import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 const MCP_URL = process.env.BIGBRAIN_URL || process.env.BIGBRAIN_MCP_URL || "http://127.0.0.1:8765/mcp";
 const HOOK_DIR = join(tmpdir(), "bigbrain-hooks");
@@ -34,6 +37,17 @@ const RUNNER_CANDIDATES = [
 
 function resolveRunner(): string | null {
 	return RUNNER_CANDIDATES.find((p) => existsSync(p)) ?? null;
+}
+
+// The runner drives the pass through a headless Pi so it reuses this Pi's providers and
+// credentials. Hand it the exact CLI entry point and this file, which the child loads as
+// its only extension.
+function thisExtensionPath(): string | undefined {
+	try {
+		return fileURLToPath(import.meta.url);
+	} catch {
+		return undefined;
+	}
 }
 
 // A detached pass has nobody watching its stderr, so every skip must leave a log line.
@@ -262,6 +276,10 @@ function triggerDetachedMaintenance(ctx: ExtensionContext) {
 				session_id: sessionId,
 				cwd: ctx.cwd,
 				turn_text: turnText,
+				pi_node: process.execPath,
+				pi_cli: process.argv[1],
+				pi_extension: thisExtensionPath(),
+				pi_model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 			})
 		);
 

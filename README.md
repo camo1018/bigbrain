@@ -84,8 +84,9 @@ uv run bigbrain install-hooks --target pi        # extension + runner + AGENTS.m
 ```
 
 Pi has no MCP client, so the installed extension registers the `memory_*` tools natively
-and runs the maintenance pass through the direct runner, which needs `node` and a
-`GEMINI_API_KEY` or `ANTHROPIC_API_KEY` (in Pi's environment or in `~/.bigbrain/env`).
+and runs the maintenance pass through the direct runner. The runner performs the pass with a
+headless `pi -p` that loads only the bigbrain extension, so it uses whatever providers and
+credentials Pi is already configured with — no separate API key needed.
 Run `/reload` in an open Pi session, or start a new one.
 
 **Verify**: start a new chat, do one turn that uses a tool, then `tail ~/.bigbrain/maintenance.log`.
@@ -284,10 +285,14 @@ turn that used a tool — pure conversational turns are skipped).
   the recall → decide → store/replace loop over the bigbrain MCP server. If the host's CLI is
   not on `PATH` it uses whichever one is, and failing both, the direct runner.
 - `hooks/bigbrain-maintenance-direct.mjs` — the standalone direct runner (Node.js ≥ 18, no
-  packages). It calls the LLM API directly — Gemini with `GEMINI_API_KEY` (default model
-  `gemini-3.7-flash`) or Anthropic with `ANTHROPIC_API_KEY` (default `claude-sonnet-5`) — and
-  executes the model's `memory_recall` / `memory_store` calls against the MCP endpoint over
-  plain HTTP. Pi uses it for every pass; Cursor and Claude Code use it as the fallback.
+  packages). Its preferred backend is a headless Pi: `pi -p --no-extensions -e bigbrain.ts
+  --tools memory_recall,memory_store --no-session`, which reuses Pi's own model config and
+  credentials and defaults to the model of the Pi session that ran the turn (override with
+  `BIGBRAIN_MAINT_PI_MODEL`, e.g. a cheaper flash-class model). Without Pi it calls the LLM API
+  directly — Gemini with `GEMINI_API_KEY` (default model `gemini-3.7-flash`) or Anthropic with
+  `ANTHROPIC_API_KEY` (default `claude-sonnet-5`) — and executes the model's `memory_recall` /
+  `memory_store` calls against the MCP endpoint over plain HTTP. Pi uses it for every pass;
+  Cursor and Claude Code use it as the fallback.
 - `hooks/pi/bigbrain.ts` — the Pi extension. Registers the seven `memory_*` tools natively and,
   on `agent_settled`, renders the finished turn and spawns the direct runner detached.
 
@@ -313,12 +318,15 @@ preserving anything already there and backing up alongside it), installs the rul
 extension to `~/.pi/agent/extensions/`, the direct runner to `~/.pi/agent/hooks/`, writes the
 rule into `~/.pi/agent/AGENTS.md` as a managed section, and installs the skills to
 `~/.pi/agent/skills/`. All of it is idempotent, and the installer warns about anything the
-pass will need at runtime that it cannot find (`jq`, the host CLI, `node`, an API key).
+pass will need at runtime that it cannot find (`jq`, the host CLI, `node`, Pi or an API key).
 
 The hook scripts require [`jq`](https://jqlang.github.io/jq/) on `PATH`, plus the headless
-agent CLI for the selected host — or, without one, `node` and an API key for the direct runner.
+agent CLI for the selected host — or, without one, `node` plus Pi (or an API key) for the direct runner.
 
 #### API keys for the direct runner
+
+Only needed when the runner cannot use Pi (no `pi` CLI, or the bigbrain Pi extension is not
+installed). With Pi available, the pass runs on Pi's configured providers instead.
 
 Hooks launched by a GUI application (Cursor started from the Dock, for instance) inherit no
 shell profile, so a key exported in `.zshrc` never reaches them. The worker and the runner
@@ -330,7 +338,8 @@ mkdir -p ~/.bigbrain && chmod 700 ~/.bigbrain
 echo 'GEMINI_API_KEY=...' >> ~/.bigbrain/env && chmod 600 ~/.bigbrain/env
 ```
 
-Gemini is picked when both keys are present; force one with `BIGBRAIN_MAINT_PROVIDER=gemini|anthropic`.
+Pi is preferred when available, then Gemini, then Anthropic; force one with
+`BIGBRAIN_MAINT_PROVIDER=pi|gemini|anthropic`.
 
 ### Installing Cursor Agent
 

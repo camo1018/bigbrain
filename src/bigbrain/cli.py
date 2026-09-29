@@ -79,7 +79,8 @@ _TARGETS = {
         "cli": None,
         "reload_hint": "Run /reload in an open Pi session (or start a new one) to load the extension.",
         "mcp_hint": (
-            f"Nothing to register: the extension talks to {_MCP_URL} directly. "
+            f"Nothing to register: the extension talks to {_MCP_URL} directly, and the "
+            "maintenance pass runs through Pi's own model config (no API key). "
             "Just keep the server running (`uv run bigbrain install-server` on macOS)."
         ),
     },
@@ -441,7 +442,8 @@ def _merge_agents_md(path: Path, body: str) -> str:
     start = existing.find(_AGENTS_BEGIN)
     end = existing.find(_AGENTS_END)
     if start != -1 and end != -1 and end > start:
-        merged = existing[:start] + section + existing[end + len(_AGENTS_END):].lstrip("\n")
+        rest = existing[end + len(_AGENTS_END):].lstrip("\n")
+        merged = existing[:start] + section + ("\n" + rest if rest else "")
     else:
         merged = existing.rstrip("\n") + "\n\n" + section if existing.strip() else section
     if merged == existing:
@@ -460,6 +462,11 @@ def _api_key_available() -> bool:
         return False
     text = env_file.read_text()
     return "GEMINI_API_KEY=" in text or "ANTHROPIC_API_KEY=" in text
+
+
+def _pi_pass_available() -> bool:
+    """Whether the direct runner can run the pass through Pi's own configured providers."""
+    return shutil.which("pi") is not None
 
 
 def _install_skills(dest_root: Path) -> list[str]:
@@ -577,9 +584,13 @@ def _install_hook_host(
             "require it at runtime. Install jq before relying on the hooks."
         )
     if shutil.which(spec["cli"]) is None:
-        fallback_ok = shutil.which("node") is not None and _api_key_available()
+        fallback_ok = shutil.which("node") is not None and (
+            _api_key_available()
+            or (_pi_pass_available() and (Path.home() / ".pi/agent/extensions/bigbrain.ts").is_file())
+        )
         status = "so the direct runner will handle the pass" if fallback_ok else (
-            "and the direct-runner fallback needs `node` plus GEMINI_API_KEY or "
+            "and the direct-runner fallback needs `node` plus either Pi with the bigbrain "
+            "extension installed (`bigbrain install-hooks --target pi`) or GEMINI_API_KEY / "
             "ANTHROPIC_API_KEY (in the environment or ~/.bigbrain/env)"
         )
         err_console.print(
@@ -619,6 +630,8 @@ def _install_hook_host(
 def _install_pi(dest_root: Path, src_hooks: Path) -> None:
     """Pi: install the extension and the direct runner it spawns.
 
+    The runner performs the pass with a headless `pi -p` that loads only the bigbrain
+    extension, so it reuses Pi's configured providers and needs no separate API key.
     Pi auto-discovers `extensions/*.ts`; the runner lives under `hooks/` so Pi does not
     try to load it as an extension. The extension looks for the runner there first and
     falls back to the stamped checkout path.
@@ -628,11 +641,13 @@ def _install_pi(dest_root: Path, src_hooks: Path) -> None:
             "[yellow]warning:[/yellow] `node` not found on PATH — the Pi maintenance "
             "pass runs on Node.js (Pi itself needs it too)."
         )
-    if not _api_key_available():
+    # The pass normally runs through a headless Pi using Pi's own providers, so no key is
+    # required. An API key is only the fallback for when the runner cannot launch Pi.
+    if not _pi_pass_available() and not _api_key_available():
         err_console.print(
-            "[yellow]note:[/yellow] no GEMINI_API_KEY or ANTHROPIC_API_KEY found. The "
-            "maintenance pass calls an LLM API directly; put the key in the environment "
-            "Pi runs in or in ~/.bigbrain/env (KEY=VALUE)."
+            "[yellow]note:[/yellow] `pi` is not on PATH here. The Pi extension passes its own "
+            "CLI path to the runner, so the pass still runs from inside Pi; standalone runs "
+            "would need GEMINI_API_KEY or ANTHROPIC_API_KEY (environment or ~/.bigbrain/env)."
         )
 
     dest_hooks = dest_root / "hooks"

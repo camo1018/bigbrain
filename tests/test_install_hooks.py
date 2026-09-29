@@ -203,3 +203,29 @@ def test_pi_opt_out_flags(tmp_path):
     assert not (tmp_path / "AGENTS.md").exists()
     assert not (tmp_path / "skills").exists()
     assert (tmp_path / "extensions" / "bigbrain.ts").is_file()
+
+
+def test_pi_install_does_not_demand_an_api_key(tmp_path, monkeypatch):
+    """With `pi` on PATH the pass runs on Pi's own providers, so no key note is printed."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("BIGBRAIN_ENV_FILE", str(tmp_path / "missing-env"))
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_pi = fake_bin / "pi"
+    fake_pi.write_text("#!/bin/sh\n")
+    fake_pi.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+
+    result = runner.invoke(
+        app, ["install-hooks", "--target", "pi", "--config-dir", str(tmp_path / "pi")]
+    )
+    assert result.exit_code == 0, result.output
+    assert "GEMINI_API_KEY" not in result.output
+
+
+def test_pi_extension_hands_runner_its_cli_and_model(tmp_path):
+    install(tmp_path, "pi")
+    text = (tmp_path / "extensions" / "bigbrain.ts").read_text()
+    for field in ("pi_cli", "pi_node", "pi_extension", "pi_model"):
+        assert field in text, f"payload field {field} missing"
