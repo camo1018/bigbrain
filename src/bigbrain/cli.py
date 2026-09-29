@@ -566,7 +566,7 @@ def install_hooks(
         "--pi-model",
         help=(
             "Model for the background memory pass, as Pi's `provider/id` (for example "
-            "llm-gateway/gemini-3.8-flash). Written to ~/.bigbrain/env as "
+            "google/gemini-3.7-flash). Written to ~/.bigbrain/env as "
             "BIGBRAIN_MAINT_PI_MODEL. Unset: the pass uses the model of the Pi session."
         ),
     ),
