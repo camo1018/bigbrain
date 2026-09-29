@@ -31,6 +31,7 @@ _HOOK_SCRIPTS = (
 )
 _DIRECT_RUNNER = "bigbrain-maintenance-direct.mjs"
 _PI_EXTENSION = "pi/bigbrain.ts"
+_PI_RUNNER_DIR = "bigbrain"
 _RULE_SOURCE = "bigbrain-memory.mdc"
 _SKILLS_DIR = "skills"
 _MCP_URL = "http://127.0.0.1:8765/mcp"
@@ -627,14 +628,31 @@ def _install_hook_host(
         console.print(f"[dim]hooks already registered[/dim] in {config_path}")
 
 
+def _remove_legacy_pi_runner(dest_root: Path) -> None:
+    """Drop the runner older installs put in `<config>/hooks/`.
+
+    Pi treats any `hooks/` directory as a leftover from before extensions and blocks
+    startup with a warning, so remove the directory too once nothing else is in it.
+    """
+    legacy_dir = dest_root / "hooks"
+    legacy = legacy_dir / _DIRECT_RUNNER
+    if legacy.is_file():
+        legacy.unlink()
+        console.print(f"[green]removed legacy script[/green] {legacy}")
+    try:
+        legacy_dir.rmdir()
+    except OSError:
+        pass  # absent, or holds files that are not ours
+
+
 def _install_pi(dest_root: Path, src_hooks: Path) -> None:
     """Pi: install the extension and the direct runner it spawns.
 
     The runner performs the pass with a headless `pi -p` that loads only the bigbrain
     extension, so it reuses Pi's configured providers and needs no separate API key.
-    Pi auto-discovers `extensions/*.ts`; the runner lives under `hooks/` so Pi does not
-    try to load it as an extension. The extension looks for the runner there first and
-    falls back to the stamped checkout path.
+    Pi auto-discovers `extensions/*.ts` and warns about a legacy `hooks/` directory, so the
+    runner lives under `bigbrain/` instead. The extension looks for the runner there first
+    and falls back to the stamped checkout path.
     """
     if shutil.which("node") is None:
         err_console.print(
@@ -650,12 +668,13 @@ def _install_pi(dest_root: Path, src_hooks: Path) -> None:
             "would need GEMINI_API_KEY or ANTHROPIC_API_KEY (environment or ~/.bigbrain/env)."
         )
 
-    dest_hooks = dest_root / "hooks"
-    dest_hooks.mkdir(parents=True, exist_ok=True)
-    runner = dest_hooks / _DIRECT_RUNNER
+    dest_runner_dir = dest_root / _PI_RUNNER_DIR
+    dest_runner_dir.mkdir(parents=True, exist_ok=True)
+    runner = dest_runner_dir / _DIRECT_RUNNER
     shutil.copyfile(src_hooks / _DIRECT_RUNNER, runner)
     os.chmod(runner, 0o755)
     console.print(f"[green]installed script[/green] {runner}")
+    _remove_legacy_pi_runner(dest_root)
 
     dest_ext = dest_root / "extensions"
     dest_ext.mkdir(parents=True, exist_ok=True)

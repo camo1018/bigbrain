@@ -151,9 +151,11 @@ def test_pi_installs_extension_runner_agents_and_skills(tmp_path):
 
     extension = tmp_path / "extensions" / "bigbrain.ts"
     assert extension.is_file()
-    runner_script = tmp_path / "hooks" / _DIRECT_RUNNER
+    runner_script = tmp_path / "bigbrain" / _DIRECT_RUNNER
     assert runner_script.is_file()
     assert os.stat(runner_script).st_mode & stat.S_IXUSR
+    # Pi warns on startup whenever <config>/hooks/ exists, so the install must not create it.
+    assert not (tmp_path / "hooks").exists()
     # Only the extension may live under extensions/: Pi loads everything there.
     assert [p.name for p in (tmp_path / "extensions").iterdir()] == ["bigbrain.ts"]
 
@@ -162,6 +164,27 @@ def test_pi_installs_extension_runner_agents_and_skills(tmp_path):
     assert "alwaysApply" not in body, "Cursor frontmatter leaked into AGENTS.md"
 
     assert (tmp_path / "skills" / "bigbrain-trim" / "SKILL.md").is_file()
+
+
+def test_pi_install_removes_legacy_hooks_runner(tmp_path):
+    legacy = tmp_path / "hooks" / _DIRECT_RUNNER
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("old runner\n")
+
+    install(tmp_path, "pi")
+    assert not (tmp_path / "hooks").exists()
+    assert (tmp_path / "bigbrain" / _DIRECT_RUNNER).is_file()
+
+
+def test_pi_install_keeps_foreign_files_in_hooks_dir(tmp_path):
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    (hooks_dir / _DIRECT_RUNNER).write_text("old runner\n")
+    (hooks_dir / "someone-elses.ts").write_text("// not ours\n")
+
+    install(tmp_path, "pi")
+    assert not (hooks_dir / _DIRECT_RUNNER).exists()
+    assert (hooks_dir / "someone-elses.ts").is_file()
 
 
 def test_pi_extension_has_repo_path_stamped(tmp_path):

@@ -8,7 +8,8 @@
 // providers and credentials as this Pi and needs no separate API key.
 //
 // Installed by `bigbrain install-hooks --target pi`, which also places the direct runner
-// under ~/.pi/agent/hooks/ and stamps the repo path below.
+// under ~/.pi/agent/bigbrain/ and stamps the repo path below. (Not ~/.pi/agent/hooks/: Pi
+// warns about that directory as a leftover from before extensions.)
 //
 // Environment overrides:
 //   BIGBRAIN_MCP_URL        bigbrain endpoint (default: http://127.0.0.1:8765/mcp)
@@ -31,7 +32,8 @@ const LOG_FILE = process.env.BIGBRAIN_MAINT_LOG || join(homedir(), ".bigbrain", 
 // checkout path as a fallback, so a fresh machine needs no hard-coded location.
 const RUNNER_CANDIDATES = [
 	process.env.BIGBRAIN_MAINT_RUNNER,
-	join(homedir(), ".pi", "agent", "hooks", "bigbrain-maintenance-direct.mjs"),
+	join(homedir(), ".pi", "agent", "bigbrain", "bigbrain-maintenance-direct.mjs"),
+	join(homedir(), ".pi", "agent", "hooks", "bigbrain-maintenance-direct.mjs"), // pre-migration installs
 	join("__BIGBRAIN_REPO__", "hooks", "bigbrain-maintenance-direct.mjs"),
 ].filter((p): p is string => !!p);
 

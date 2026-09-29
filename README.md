@@ -315,7 +315,8 @@ For Cursor and Claude Code the installer copies the scripts to `<config>/hooks/`
 the entries into the host's config (`~/.cursor/hooks.json` or `~/.claude/settings.json`,
 preserving anything already there and backing up alongside it), installs the rule to
 `<config>/rules/`, and installs the bundled skills to `<config>/skills/`. For Pi it copies the
-extension to `~/.pi/agent/extensions/`, the direct runner to `~/.pi/agent/hooks/`, writes the
+extension to `~/.pi/agent/extensions/`, the direct runner to `~/.pi/agent/bigbrain/` (not
+`hooks/`, which Pi flags as a legacy directory; an old copy there is removed), writes the
 rule into `~/.pi/agent/AGENTS.md` as a managed section, and installs the skills to
 `~/.pi/agent/skills/`. All of it is idempotent, and the installer warns about anything the
 pass will need at runtime that it cannot find (`jq`, the host CLI, `node`, Pi or an API key).
