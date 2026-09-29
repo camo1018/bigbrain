@@ -454,20 +454,75 @@ def _merge_agents_md(path: Path, body: str) -> str:
     return "updated"
 
 
-def _api_key_available() -> bool:
-    """Whether the direct runner would find an LLM key in the env or ~/.bigbrain/env."""
-    if os.environ.get("GEMINI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"):
-        return True
-    env_file = Path(os.environ.get("BIGBRAIN_ENV_FILE", Config.from_env().home / "env"))
-    if not env_file.is_file():
-        return False
-    text = env_file.read_text()
-    return "GEMINI_API_KEY=" in text or "ANTHROPIC_API_KEY=" in text
+def _env_file() -> Path:
+    """The KEY=VALUE settings file the hook scripts and the direct runner read."""
+    return Path(os.environ.get("BIGBRAIN_ENV_FILE", Config.from_env().home / "env"))
+
+
+def _read_env_setting(key: str) -> Optional[str]:
+    """A setting from the environment, else from the settings file (as the runner reads it)."""
+    if os.environ.get(key):
+        return os.environ[key]
+    path = _env_file()
+    if not path.is_file():
+        return None
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        name, sep, value = line.partition("=")
+        if sep and name.strip() == key:
+            return value.strip().strip("\"'") or None
+    return None
+
+
+def _write_env_setting(key: str, value: str) -> str:
+    """Set KEY=VALUE in the settings file, keeping every other line.
+
+    Returns "created", "updated", or "unchanged". The file can hold API keys, so it is
+    kept private (0600, in a 0700 directory).
+    """
+    path = _env_file()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    new_line = f"{key}={value}"
+    if not path.exists():
+        path.write_text(
+            "# bigbrain settings, read by the memory-maintenance hooks and runner.\n"
+            f"{new_line}\n"
+        )
+        os.chmod(path, 0o600)
+        return "created"
+
+    lines = path.read_text().splitlines()
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if line.partition("=")[0].strip() == key and "=" in line:
+            if raw == new_line:
+                return "unchanged"
+            lines[i] = new_line
+            break
+    else:
+        lines.append(new_line)
+    path.write_text("\n".join(lines) + "\n")
+    os.chmod(path, 0o600)
+    return "updated"
 
 
 def _pi_pass_available() -> bool:
-    """Whether the direct runner can run the pass through Pi's own configured providers."""
-    return shutil.which("pi") is not None
+    """Whether the direct runner can run the pass through a headless Pi.
+
+    That needs the `pi` CLI (the Pi extension hands the runner its own path, so this only
+    matters for runs started outside Pi) and the bigbrain extension the child Pi loads.
+    """
+    extension = Path(
+        os.environ.get(
+            "BIGBRAIN_MAINT_PI_EXTENSION",
+            Path.home() / ".pi" / "agent" / "extensions" / "bigbrain.ts",
+        )
+    ).expanduser()
+    return shutil.which("pi") is not None and extension.is_file()
 
 
 def _install_skills(dest_root: Path) -> list[str]:
@@ -506,6 +561,15 @@ def install_hooks(
     with_rule: bool = typer.Option(
         True, "--with-rule/--no-rule", help="Also install the bigbrain memory rule."
     ),
+    pi_model: Optional[str] = typer.Option(
+        None,
+        "--pi-model",
+        help=(
+            "Model for the background memory pass, as Pi's `provider/id` (for example "
+            "llm-gateway/gemini-3.8-flash). Written to ~/.bigbrain/env as "
+            "BIGBRAIN_MAINT_PI_MODEL. Unset: the pass uses the model of the Pi session."
+        ),
+    ),
     with_skills: bool = typer.Option(
         True, "--with-skills/--no-skills", help="Also install the bundled bigbrain skills."
     ),
@@ -535,6 +599,22 @@ def install_hooks(
         _install_pi(dest_root, src_hooks)
     else:
         _install_hook_host(target, spec, dest_root, default_root, src_hooks)
+
+    # The background pass runs through Pi for every host that falls back to the direct
+    # runner, so its model lives in the shared settings file rather than in Pi's config.
+    env_file = _env_file()
+    if pi_model:
+        outcome = _write_env_setting("BIGBRAIN_MAINT_PI_MODEL", pi_model)
+        console.print(
+            f"[green]{outcome}[/green] BIGBRAIN_MAINT_PI_MODEL={pi_model} in {env_file}"
+        )
+    elif current := _read_env_setting("BIGBRAIN_MAINT_PI_MODEL"):
+        console.print(f"[dim]background pass model: {current} (from {env_file})[/dim]")
+    else:
+        console.print(
+            "[dim]background pass model: the Pi session's model. Pin one with "
+            f"--pi-model or BIGBRAIN_MAINT_PI_MODEL in {env_file}.[/dim]"
+        )
 
     if with_rule:
         src_rule = _REPO_ROOT / "rules" / _RULE_SOURCE
@@ -585,14 +665,10 @@ def _install_hook_host(
             "require it at runtime. Install jq before relying on the hooks."
         )
     if shutil.which(spec["cli"]) is None:
-        fallback_ok = shutil.which("node") is not None and (
-            _api_key_available()
-            or (_pi_pass_available() and (Path.home() / ".pi/agent/extensions/bigbrain.ts").is_file())
-        )
-        status = "so the direct runner will handle the pass" if fallback_ok else (
-            "and the direct-runner fallback needs `node` plus either Pi with the bigbrain "
-            "extension installed (`bigbrain install-hooks --target pi`) or GEMINI_API_KEY / "
-            "ANTHROPIC_API_KEY (in the environment or ~/.bigbrain/env)"
+        fallback_ok = shutil.which("node") is not None and _pi_pass_available()
+        status = "so the pass will run through Pi instead" if fallback_ok else (
+            "and the fallback runs the pass through Pi, which needs `node`, `pi`, and the "
+            "bigbrain Pi extension (`bigbrain install-hooks --target pi`)"
         )
         err_console.print(
             f"[yellow]note:[/yellow] `{spec['cli']}` not found on PATH, {status}."
@@ -659,13 +735,10 @@ def _install_pi(dest_root: Path, src_hooks: Path) -> None:
             "[yellow]warning:[/yellow] `node` not found on PATH — the Pi maintenance "
             "pass runs on Node.js (Pi itself needs it too)."
         )
-    # The pass normally runs through a headless Pi using Pi's own providers, so no key is
-    # required. An API key is only the fallback for when the runner cannot launch Pi.
-    if not _pi_pass_available() and not _api_key_available():
+    if shutil.which("pi") is None:
         err_console.print(
-            "[yellow]note:[/yellow] `pi` is not on PATH here. The Pi extension passes its own "
-            "CLI path to the runner, so the pass still runs from inside Pi; standalone runs "
-            "would need GEMINI_API_KEY or ANTHROPIC_API_KEY (environment or ~/.bigbrain/env)."
+            "[yellow]note:[/yellow] `pi` is not on PATH here. That is fine inside Pi: the "
+            "extension hands the runner its own CLI path."
         )
 
     dest_runner_dir = dest_root / _PI_RUNNER_DIR

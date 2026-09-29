@@ -17,12 +17,12 @@
 #   BIGBRAIN_MAINT_DRYRUN     print the assembled prompt and exit without running it
 #   BIGBRAIN_MAINT_KEEP_SESSION  keep the headless session's artifacts (Cursor only)
 #   BIGBRAIN_MAINT_HOST       force the runner: claude | cursor | direct
-#   BIGBRAIN_ENV_FILE         KEY=VALUE file read for missing API keys (default: ~/.bigbrain/env)
+#   BIGBRAIN_ENV_FILE         KEY=VALUE settings file, e.g. BIGBRAIN_MAINT_PI_MODEL (default: ~/.bigbrain/env)
 #
 # When neither `claude` nor `cursor-agent` is installed, the pass falls back to
-# bigbrain-maintenance-direct.mjs, which drives a headless Pi (when `pi` and the bigbrain
-# Pi extension are installed) or calls Gemini / Anthropic with GEMINI_API_KEY or
-# ANTHROPIC_API_KEY.
+# bigbrain-maintenance-direct.mjs, which runs it through a headless Pi (model from
+# BIGBRAIN_MAINT_PI_MODEL). Gemini / Anthropic API calls are used only when
+# BIGBRAIN_MAINT_PROVIDER selects them.
 set -uo pipefail
 
 # Cursor Agent installs to ~/.local/bin on macOS, but GUI-launched hook processes do not
@@ -80,7 +80,7 @@ else
   host=claude
 fi
 
-# Hooks launched by a GUI application inherit no shell profile, so API keys for the direct
+# Hooks launched by a GUI application inherit no shell profile, so settings for the direct
 # runner are also read from a KEY=VALUE file. Only variables not already set are filled in.
 env_file="${BIGBRAIN_ENV_FILE:-$HOME/.bigbrain/env}"
 if [[ -f "$env_file" ]]; then
@@ -101,10 +101,15 @@ fi
 # standalone direct runner takes over if Node and an API key are available.
 direct_script="$(dirname "$0")/bigbrain-maintenance-direct.mjs"
 direct_ok=0
-if command -v node >/dev/null 2>&1 && [[ -f "$direct_script" ]] \
-   && { [[ -n "${GEMINI_API_KEY:-}" || -n "${ANTHROPIC_API_KEY:-}" ]] \
-        || { command -v pi >/dev/null 2>&1 \
-             && [[ -f "${BIGBRAIN_MAINT_PI_EXTENSION:-$HOME/.pi/agent/extensions/bigbrain.ts}" ]]; }; }; then
+direct_backend="$(printf '%s' "${BIGBRAIN_MAINT_PROVIDER:-pi}" | tr '[:upper:]' '[:lower:]')"
+case "$direct_backend" in
+  pi)        backend_ok() { command -v pi >/dev/null 2>&1 \
+                && [[ -f "${BIGBRAIN_MAINT_PI_EXTENSION:-$HOME/.pi/agent/extensions/bigbrain.ts}" ]]; } ;;
+  gemini)    backend_ok() { [[ -n "${GEMINI_API_KEY:-}" ]]; } ;;
+  anthropic) backend_ok() { [[ -n "${ANTHROPIC_API_KEY:-}" ]]; } ;;
+  *)         backend_ok() { false; } ;;
+esac
+if command -v node >/dev/null 2>&1 && [[ -f "$direct_script" ]] && backend_ok; then
   direct_ok=1
 fi
 
@@ -114,7 +119,7 @@ fi
 
 if [[ "$host" == direct ]]; then
   if (( ! direct_ok )); then
-    note "session=$sid skipped: BIGBRAIN_MAINT_HOST=direct but node, the runner, or a model (pi + bigbrain extension, or an API key) is missing"
+    note "session=$sid skipped: BIGBRAIN_MAINT_HOST=direct but node, the runner, or the $direct_backend backend is not available"
     exit 0
   fi
 elif ! command -v "$([[ $host == claude ]] && echo claude || echo cursor-agent)" >/dev/null 2>&1; then
@@ -125,7 +130,7 @@ elif ! command -v "$([[ $host == claude ]] && echo claude || echo cursor-agent)"
   elif (( direct_ok )); then
     host=direct
   else
-    note "session=$sid skipped: neither claude nor cursor-agent is on PATH, and the direct runner needs node plus either pi with the bigbrain extension or GEMINI_API_KEY / ANTHROPIC_API_KEY (env or $env_file)"
+    note "session=$sid skipped: neither claude nor cursor-agent is on PATH, and the direct runner ($direct_backend backend) needs node plus pi with the bigbrain extension (or the API key for BIGBRAIN_MAINT_PROVIDER, env or $env_file)"
     exit 0
   fi
 fi

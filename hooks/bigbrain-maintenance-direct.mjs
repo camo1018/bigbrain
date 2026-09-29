@@ -1,37 +1,38 @@
 #!/usr/bin/env node
 // Standalone runner for the bigbrain memory-maintenance pass.
 //
-// Runs the recall -> decide -> store/replace loop by calling an LLM API directly and
-// executing its tool calls against the bigbrain MCP server over HTTP. No headless agent
-// CLI is involved, so this is what the Pi extension uses and what the Cursor / Claude Code
-// worker falls back to when neither `cursor-agent` nor `claude` is installed.
+// Runs the recall -> decide -> store/replace loop for one finished turn and executes the
+// model's tool calls against the bigbrain MCP server. This is what the Pi extension uses
+// and what the Cursor / Claude Code worker falls back to when neither `cursor-agent` nor
+// `claude` is installed.
 //
 // Usage: bigbrain-maintenance-direct.mjs <payload-file>
 //   The payload is JSON with `session_id` and `turn_text` (the rendered turn). The file is
 //   deleted once read.
 //
-// Providers, tried in this order (force one with BIGBRAIN_MAINT_PROVIDER=pi|gemini|anthropic):
-//   pi                  -> a headless `pi -p` run that reuses Pi's own configured providers
-//                          and credentials, so no separate API key is needed. Used when the
-//                          payload names the Pi CLI (the Pi extension sends it) or `pi` is on
-//                          PATH. Only the bigbrain extension is loaded and only
-//                          memory_recall / memory_store are enabled.
-//   GEMINI_API_KEY      -> Gemini generateContent   (default model: gemini-3.7-flash)
-//   ANTHROPIC_API_KEY   -> Anthropic Messages API   (default model: claude-sonnet-5)
-// Keys are read from the environment first, then from ~/.bigbrain/env (KEY=VALUE lines),
-// because hooks launched by a GUI application do not inherit a shell profile.
+// Backend (BIGBRAIN_MAINT_PROVIDER, default: pi):
+//   pi         -> a headless `pi -p` run that reuses Pi's own configured providers and
+//                 credentials, so no API key is needed. Only the bigbrain extension is
+//                 loaded and only memory_recall / memory_store are enabled. Pi is found
+//                 via the CLI path in the payload (the Pi extension sends it) or on PATH.
+//   gemini     -> Gemini generateContent with GEMINI_API_KEY    (opt-in legacy backend)
+//   anthropic  -> Anthropic Messages API with ANTHROPIC_API_KEY (opt-in legacy backend)
+// The legacy backends are used only when selected explicitly; having a key set is not
+// enough.
 //
-// Environment overrides:
-//   BIGBRAIN_MAINT_DIRECT_MODEL  model id for the gemini / anthropic provider
-//   BIGBRAIN_MAINT_PI_MODEL      Pi model pattern, e.g. llm-gateway/gemini-3.8-flash
-//                                (default: the model of the Pi session that ran the turn,
-//                                else Pi's default model)
+// Settings are read from the environment first, then from ~/.bigbrain/env (KEY=VALUE
+// lines), because hooks launched by a GUI application do not inherit a shell profile.
+//   BIGBRAIN_MAINT_PI_MODEL      Pi model for the pass, as `provider/id` or any pattern
+//                                `pi --model` accepts (default: the model of the Pi
+//                                session that ran the turn, else Pi's default model)
 //   BIGBRAIN_MAINT_PI_THINKING   Pi thinking level for the pass (default: low)
 //   BIGBRAIN_MAINT_PI_EXTENSION  path to bigbrain.ts (default: ~/.pi/agent/extensions/bigbrain.ts)
+//   BIGBRAIN_MAINT_PROVIDER      pi | gemini | anthropic
+//   BIGBRAIN_MAINT_DIRECT_MODEL  model id for the gemini / anthropic backend
 //   BIGBRAIN_MAINT_TIMEOUT       wall-clock seconds for the whole pass (default: 300)
 //   BIGBRAIN_MAINT_LOG           log file (default: ~/.bigbrain/maintenance.log)
 //   BIGBRAIN_MCP_URL             bigbrain endpoint (default: http://127.0.0.1:8765/mcp)
-//   BIGBRAIN_ENV_FILE            env file to read keys from (default: ~/.bigbrain/env)
+//   BIGBRAIN_ENV_FILE            settings file (default: ~/.bigbrain/env)
 //   BIGBRAIN_MAINT_DRYRUN        print the provider and assembled prompt, then exit
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
@@ -410,29 +411,24 @@ async function runPi(fullPrompt, { command, extension, model }) {
 // ------------------------------------------------------------------------------ main
 
 function pickProvider(payload) {
-	const forced = process.env.BIGBRAIN_MAINT_PROVIDER;
-	const piCommand = resolvePiCommand(payload);
-	const piExtension = resolvePiExtension(payload);
-	const piReady = !!(piCommand && piExtension);
-	const candidates = [
-		["gemini", process.env.GEMINI_API_KEY],
-		["anthropic", process.env.ANTHROPIC_API_KEY],
-	];
-	const piChoice = { provider: "pi", pi: { command: piCommand, extension: piExtension } };
-	if (forced === "pi") {
-		if (!piCommand) throw new Error("BIGBRAIN_MAINT_PROVIDER=pi but the pi CLI was not found");
-		if (!piExtension) throw new Error("BIGBRAIN_MAINT_PROVIDER=pi but bigbrain.ts was not found");
-		return piChoice;
+	const provider = (process.env.BIGBRAIN_MAINT_PROVIDER || "pi").trim().toLowerCase();
+	if (provider === "pi") {
+		const command = resolvePiCommand(payload);
+		if (!command) throw new Error("the pi CLI was not found (not in the payload, not on PATH)");
+		const extension = resolvePiExtension(payload);
+		if (!extension) {
+			throw new Error("bigbrain.ts was not found; run `bigbrain install-hooks --target pi`");
+		}
+		return { provider, pi: { command, extension } };
 	}
-	if (forced) {
-		const hit = candidates.find(([name]) => name === forced);
-		if (!hit) throw new Error(`unknown BIGBRAIN_MAINT_PROVIDER '${forced}' (pi|gemini|anthropic)`);
-		if (!hit[1]) throw new Error(`BIGBRAIN_MAINT_PROVIDER=${forced} but its API key is not set`);
-		return { provider: forced, apiKey: hit[1] };
+	const keys = { gemini: process.env.GEMINI_API_KEY, anthropic: process.env.ANTHROPIC_API_KEY };
+	if (!(provider in keys)) {
+		throw new Error(`unknown BIGBRAIN_MAINT_PROVIDER '${provider}' (pi|gemini|anthropic)`);
 	}
-	if (piReady) return piChoice;
-	const hit = candidates.find(([, key]) => !!key);
-	return hit ? { provider: hit[0], apiKey: hit[1] } : null;
+	if (!keys[provider]) {
+		throw new Error(`BIGBRAIN_MAINT_PROVIDER=${provider} but ${provider.toUpperCase()}_API_KEY is not set`);
+	}
+	return { provider, apiKey: keys[provider] };
 }
 
 async function main() {
@@ -469,10 +465,6 @@ async function main() {
 		chosen = pickProvider(payload);
 	} catch (err) {
 		logNote(`session=${sessionId} skipped: ${err.message}`);
-		return;
-	}
-	if (!chosen) {
-		logNote(`session=${sessionId} skipped: no pi CLI + bigbrain.ts, and no GEMINI_API_KEY or ANTHROPIC_API_KEY (set it in the environment or in ${ENV_FILE})`);
 		return;
 	}
 	const { provider, apiKey } = chosen;

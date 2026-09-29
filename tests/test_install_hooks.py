@@ -28,6 +28,15 @@ from bigbrain.cli import (
 
 runner = CliRunner()
 
+
+@pytest.fixture(autouse=True)
+def isolated_env_file(tmp_path, monkeypatch):
+    """Keep every test away from the real ~/.bigbrain/env."""
+    env_file = tmp_path / "bigbrain-env"
+    monkeypatch.setenv("BIGBRAIN_ENV_FILE", str(env_file))
+    monkeypatch.delenv("BIGBRAIN_MAINT_PI_MODEL", raising=False)
+    return env_file
+
 TARGETS = ["cursor", "claude"]
 
 
@@ -252,3 +261,27 @@ def test_pi_extension_hands_runner_its_cli_and_model(tmp_path):
     text = (tmp_path / "extensions" / "bigbrain.ts").read_text()
     for field in ("pi_cli", "pi_node", "pi_extension", "pi_model"):
         assert field in text, f"payload field {field} missing"
+
+
+def test_pi_model_is_written_to_the_env_file(tmp_path, isolated_env_file):
+    install(tmp_path / "pi", "pi", "--pi-model", "gw/fast-model")
+    text = isolated_env_file.read_text()
+    assert "BIGBRAIN_MAINT_PI_MODEL=gw/fast-model" in text
+    assert stat.S_IMODE(os.stat(isolated_env_file).st_mode) == 0o600
+
+
+def test_pi_model_update_keeps_other_env_lines(tmp_path, isolated_env_file):
+    isolated_env_file.write_text(
+        "# mine\nGEMINI_API_KEY=abc\nexport BIGBRAIN_MAINT_PI_MODEL=old/model\nFOO=bar\n"
+    )
+    install(tmp_path / "pi", "pi", "--pi-model", "new/model")
+    lines = isolated_env_file.read_text().splitlines()
+    assert lines == ["# mine", "GEMINI_API_KEY=abc", "BIGBRAIN_MAINT_PI_MODEL=new/model", "FOO=bar"]
+
+    install(tmp_path / "pi", "pi", "--pi-model", "new/model")
+    assert isolated_env_file.read_text().splitlines() == lines
+
+
+def test_install_without_pi_model_leaves_env_file_alone(tmp_path, isolated_env_file):
+    install(tmp_path / "pi", "pi")
+    assert not isolated_env_file.exists()
