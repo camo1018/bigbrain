@@ -2,9 +2,9 @@
 // Standalone runner for the bigbrain memory-maintenance pass.
 //
 // Runs the recall -> decide -> store/replace loop for one finished turn and executes the
-// model's tool calls against the bigbrain MCP server. This is what the Pi extension uses
-// and what the Cursor / Claude Code worker falls back to when neither `cursor-agent` nor
-// `claude` is installed.
+// model's tool calls against the bigbrain MCP server. This is what the Pi extension uses.
+// The Cursor / Claude Code worker runs it only when the user opts in with
+// BIGBRAIN_MAINT_HOST=pi (or =direct); it is never a silent fallback for those hosts.
 //
 // Usage: bigbrain-maintenance-direct.mjs <payload-file>
 //   The payload is JSON with `session_id` and `turn_text` (the rendered turn). The file is

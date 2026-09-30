@@ -285,3 +285,33 @@ def test_pi_model_update_keeps_other_env_lines(tmp_path, isolated_env_file):
 def test_install_without_pi_model_leaves_env_file_alone(tmp_path, isolated_env_file):
     install(tmp_path / "pi", "pi")
     assert not isolated_env_file.exists()
+
+
+@pytest.mark.parametrize("target", TARGETS)
+def test_host_install_does_not_mention_the_pi_model(tmp_path, target):
+    """Cursor / Claude Code run the pass on their own CLI unless Pi is opted into."""
+    result = install(tmp_path, target)
+    assert "background pass model" not in result.output
+
+
+@pytest.mark.parametrize("target", TARGETS)
+def test_missing_host_cli_note_does_not_route_to_pi(tmp_path, target, monkeypatch):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_pi = fake_bin / "pi"
+    fake_pi.write_text("#!/bin/sh\n")
+    fake_pi.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))  # pi present, neither host CLI
+    result = install(tmp_path / "cfg", target)
+    assert "will be skipped" in result.output
+    assert "BIGBRAIN_MAINT_HOST=pi" in result.output
+    assert "run through Pi instead" not in result.output
+
+
+@pytest.mark.parametrize("target", TARGETS)
+def test_pi_opt_in_without_pi_warns(tmp_path, target, isolated_env_file, monkeypatch):
+    isolated_env_file.write_text("BIGBRAIN_MAINT_HOST=pi\n")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+    result = install(tmp_path / "cfg", target)
+    assert "BIGBRAIN_MAINT_HOST=pi is set" in result.output

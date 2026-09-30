@@ -16,19 +16,24 @@
 #   BIGBRAIN_MCP_URL          bigbrain MCP endpoint             (default: http://127.0.0.1:8765/mcp)
 #   BIGBRAIN_MAINT_DRYRUN     print the assembled prompt and exit without running it
 #   BIGBRAIN_MAINT_KEEP_SESSION  keep the headless session's artifacts (Cursor only)
-#   BIGBRAIN_MAINT_HOST       force the runner: claude | cursor | direct
-#   BIGBRAIN_ENV_FILE         KEY=VALUE settings file, e.g. BIGBRAIN_MAINT_PI_MODEL (default: ~/.bigbrain/env)
+#   BIGBRAIN_MAINT_HOST       force the runner: claude | cursor | pi | direct
+#   BIGBRAIN_ENV_FILE         KEY=VALUE settings file (default: ~/.bigbrain/env)
 #
-# When neither `claude` nor `cursor-agent` is installed, the pass falls back to
-# bigbrain-maintenance-direct.mjs, which runs it through a headless Pi (model from
-# BIGBRAIN_MAINT_PI_MODEL). Gemini / Anthropic API calls are used only when
-# BIGBRAIN_MAINT_PROVIDER selects them.
+# By default the pass runs on the host's own headless CLI (`claude -p` / `cursor-agent -p`),
+# falling back to the other one if only that is installed. With neither, the pass is
+# skipped and logged. Nothing else is tried unless the user opts in:
+#   BIGBRAIN_MAINT_HOST=pi      run the pass through a headless Pi (bigbrain-maintenance-direct.mjs;
+#                               model from BIGBRAIN_MAINT_PI_MODEL). Needs `pi` and the bigbrain
+#                               Pi extension (`bigbrain install-hooks --target pi`).
+#   BIGBRAIN_MAINT_HOST=direct  run the direct runner with BIGBRAIN_MAINT_PROVIDER
+#                               (pi | gemini | anthropic).
 set -uo pipefail
 
 # Cursor Agent installs to ~/.local/bin on macOS, but GUI-launched hook processes do not
 # reliably inherit shell-profile PATH changes. Include the standard user binary directory
-# explicitly so the detached worker can resolve cursor-agent after installation.
-export PATH="$HOME/.local/bin:$PATH"
+# explicitly so the detached worker can resolve cursor-agent after installation. Pi's own
+# installer puts its launcher in ~/.pi/agent/bin, which matters only for BIGBRAIN_MAINT_HOST=pi.
+export PATH="$HOME/.local/bin:$PATH:$HOME/.pi/agent/bin"
 
 payload_file="${1:?usage: bigbrain-maintenance-run.sh <payload-file>}"
 trap 'rm -f "$payload_file"' EXIT
@@ -96,44 +101,60 @@ if [[ -f "$env_file" ]]; then
   done < "$env_file"
 fi
 
-# Fall back to whichever CLI is actually installed rather than failing with "command
-# not found" in a detached process nobody is watching. With neither CLI present, the
-# standalone direct runner takes over if Node and an API key are available.
-direct_script="$(dirname "$0")/bigbrain-maintenance-direct.mjs"
-direct_ok=0
-direct_backend="$(printf '%s' "${BIGBRAIN_MAINT_PROVIDER:-pi}" | tr '[:upper:]' '[:lower:]')"
-case "$direct_backend" in
-  pi)        backend_ok() { command -v pi >/dev/null 2>&1 \
-                && [[ -f "${BIGBRAIN_MAINT_PI_EXTENSION:-$HOME/.pi/agent/extensions/bigbrain.ts}" ]]; } ;;
-  gemini)    backend_ok() { [[ -n "${GEMINI_API_KEY:-}" ]]; } ;;
-  anthropic) backend_ok() { [[ -n "${ANTHROPIC_API_KEY:-}" ]]; } ;;
-  *)         backend_ok() { false; } ;;
-esac
-if command -v node >/dev/null 2>&1 && [[ -f "$direct_script" ]] && backend_ok; then
-  direct_ok=1
-fi
-
 if [[ -n "${BIGBRAIN_MAINT_HOST:-}" ]]; then
-  host="$BIGBRAIN_MAINT_HOST"
+  host="$(printf '%s' "$BIGBRAIN_MAINT_HOST" | tr '[:upper:]' '[:lower:]')"
 fi
 
-if [[ "$host" == direct ]]; then
-  if (( ! direct_ok )); then
-    note "session=$sid skipped: BIGBRAIN_MAINT_HOST=direct but node, the runner, or the $direct_backend backend is not available"
+# Pi and the raw model APIs are opt-in backends for Cursor / Claude Code: they run only when
+# BIGBRAIN_MAINT_HOST names them, never as a silent fallback. BIGBRAIN_MAINT_HOST=pi pins the
+# direct runner's provider to Pi; =direct leaves it to BIGBRAIN_MAINT_PROVIDER.
+direct_script="$(dirname "$0")/bigbrain-maintenance-direct.mjs"
+pi_extension="${BIGBRAIN_MAINT_PI_EXTENSION:-$HOME/.pi/agent/extensions/bigbrain.ts}"
+direct_missing() {
+  local backend="$1"
+  command -v node >/dev/null 2>&1 || { echo "node is not on PATH"; return; }
+  [[ -f "$direct_script" ]] || { echo "the runner is missing at $direct_script"; return; }
+  case "$backend" in
+    pi)
+      command -v pi >/dev/null 2>&1 || { echo "pi is not installed (not on PATH or in ~/.pi/agent/bin)"; return; }
+      [[ -f "$pi_extension" ]] || echo "the bigbrain Pi extension is missing at $pi_extension (run \`bigbrain install-hooks --target pi\`)" ;;
+    gemini)    [[ -n "${GEMINI_API_KEY:-}" ]] || echo "GEMINI_API_KEY is not set" ;;
+    anthropic) [[ -n "${ANTHROPIC_API_KEY:-}" ]] || echo "ANTHROPIC_API_KEY is not set" ;;
+    *)         echo "unknown BIGBRAIN_MAINT_PROVIDER '$backend' (pi|gemini|anthropic)" ;;
+  esac
+}
+
+case "$host" in
+  pi|direct)
+    if [[ "$host" == pi ]]; then
+      export BIGBRAIN_MAINT_PROVIDER=pi
+    fi
+    backend="$(printf '%s' "${BIGBRAIN_MAINT_PROVIDER:-pi}" | tr '[:upper:]' '[:lower:]')"
+    missing="$(direct_missing "$backend")"
+    if [[ -n "$missing" ]]; then
+      note "session=$sid skipped: BIGBRAIN_MAINT_HOST=$host but $missing"
+      exit 0
+    fi
+    ;;
+  claude|cursor)
+    # Fall back to whichever CLI is actually installed rather than failing with "command
+    # not found" in a detached process nobody is watching.
+    if ! command -v "$([[ $host == claude ]] && echo claude || echo cursor-agent)" >/dev/null 2>&1; then
+      if [[ "$host" == claude ]] && command -v cursor-agent >/dev/null 2>&1; then
+        host=cursor
+      elif [[ "$host" == cursor ]] && command -v claude >/dev/null 2>&1; then
+        host=claude
+      else
+        note "session=$sid skipped: neither claude nor cursor-agent is on PATH (set BIGBRAIN_MAINT_HOST=pi in $env_file to run the pass through Pi instead)"
+        exit 0
+      fi
+    fi
+    ;;
+  *)
+    note "session=$sid skipped: unknown BIGBRAIN_MAINT_HOST '$host' (claude|cursor|pi|direct)"
     exit 0
-  fi
-elif ! command -v "$([[ $host == claude ]] && echo claude || echo cursor-agent)" >/dev/null 2>&1; then
-  if [[ "$host" == claude ]] && command -v cursor-agent >/dev/null 2>&1; then
-    host=cursor
-  elif [[ "$host" == cursor ]] && command -v claude >/dev/null 2>&1; then
-    host=claude
-  elif (( direct_ok )); then
-    host=direct
-  else
-    note "session=$sid skipped: neither claude nor cursor-agent is on PATH, and the direct runner ($direct_backend backend) needs node plus pi with the bigbrain extension (or the API key for BIGBRAIN_MAINT_PROVIDER, env or $env_file)"
-    exit 0
-  fi
-fi
+    ;;
+esac
 
 # The pass has to judge what is durable and then drive the recall/store loop over MCP.
 # Haiku-class models reliably fail that: they answer in prose and skip the tool calls.
@@ -255,7 +276,7 @@ allowed_claude="mcp__bigbrain__memory_recall,mcp__bigbrain__memory_store,mcp__bi
 # from spawning another pass.
 export BIGBRAIN_MAINT=1
 
-if [[ "$host" == direct ]]; then
+if [[ "$host" == pi || "$host" == direct ]]; then
   direct_payload="$(mktemp "${TMPDIR:-/tmp}/bigbrain-direct-XXXXXX.json")"
   jq -n --arg sid "$sid" --arg turn "$turn" '{session_id: $sid, turn_text: $turn}' > "$direct_payload"
   node "$direct_script" "$direct_payload"

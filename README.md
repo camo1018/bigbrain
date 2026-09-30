@@ -145,9 +145,9 @@ the MCP tools. For the automatic background-maintenance pass:
 - **Claude Code hooks** launch `claude -p`.
 - **Pi** runs the direct runner on `agent_settled`.
 - **Direct runner** (`hooks/bigbrain-maintenance-direct.mjs`) is a standalone Node.js
-  script that calls Gemini or Anthropic directly and drives the memory tools over HTTP. It
-  is what Pi uses, and what the Cursor / Claude Code worker falls back to when the host's
-  CLI is not installed.
+  script that runs the pass through a headless Pi (or, when selected, calls Gemini or
+  Anthropic directly). It is what Pi uses. Cursor and Claude Code use it only when you opt
+  in with `BIGBRAIN_MAINT_HOST=pi` (or `direct`); it is never a silent fallback for them.
 
 ### Recommended: one shared HTTP server (macOS LaunchAgent)
 
@@ -285,13 +285,14 @@ turn that used a tool — pure conversational turns are skipped).
   and Cursor (`cursor-agent -p`). It reads the turn out of the session transcript (including
   Cursor side chats nested under a parent session) and runs a headless agent session to execute
   the recall → decide → store/replace loop over the bigbrain MCP server. If the host's CLI is
-  not on `PATH` it uses whichever one is, and failing both, the direct runner.
+  not on `PATH` it uses the other one; with neither, the pass is skipped and logged. Pi is
+  used only when you opt in with `BIGBRAIN_MAINT_HOST=pi` (see [Background model](#background-model)).
 - `hooks/bigbrain-maintenance-direct.mjs` — the standalone direct runner (Node.js ≥ 18, no
   packages). It runs the pass through a headless Pi: `pi -p --no-extensions -e bigbrain.ts
   --tools memory_recall,memory_store --no-session`, which reuses Pi's own model config and
   credentials. The model comes from `BIGBRAIN_MAINT_PI_MODEL` (see
   [Background model](#background-model)). Pi uses it for every pass; Cursor and Claude Code use
-  it as the fallback.
+  it only when opted in with `BIGBRAIN_MAINT_HOST=pi`.
 - `hooks/pi/bigbrain.ts` — the Pi extension. Registers the seven `memory_*` tools natively and,
   on `agent_settled`, renders the finished turn and spawns the direct runner detached.
 
@@ -321,7 +322,9 @@ rule into `~/.pi/agent/AGENTS.md` as a managed section, and installs the skills 
 pass will need at runtime that it cannot find (`jq`, the host CLI, `node`, `pi`).
 
 The hook scripts require [`jq`](https://jqlang.github.io/jq/) on `PATH`, plus the headless
-agent CLI for the selected host — or, without one, `node` plus Pi for the direct runner.
+agent CLI for the selected host (`cursor-agent` or `claude`). Running the pass through Pi
+instead is opt-in (`BIGBRAIN_MAINT_HOST=pi`) and needs `node`, `pi`, and the bigbrain Pi
+extension.
 
 #### Background model
 
@@ -339,7 +342,18 @@ BIGBRAIN_MAINT_PI_THINKING=low               # optional; off|minimal|low|medium|
 
 `bigbrain install-hooks --pi-model <provider>/<model>` writes the first line for you (the file
 is kept at mode 0600). Without it, the pass uses the model of the Pi session that ran the turn,
-or Pi's default model when started from Cursor or Claude Code. The pass is a short recall/store
+or Pi's default model when started from Cursor or Claude Code.
+
+Cursor and Claude Code run the pass on their own CLI (`cursor-agent -p` / `claude -p`) and
+never switch to Pi on their own. To run their pass through Pi instead, opt in explicitly:
+
+```bash
+# ~/.bigbrain/env
+BIGBRAIN_MAINT_HOST=pi   # needs node, pi, and `bigbrain install-hooks --target pi`
+```
+
+If that is set and Pi is not available, the pass is skipped and the reason is logged; it does
+not fall back to the host CLI. The pass is a short recall/store
 loop, so a fast model is usually the right choice, but not the smallest: models that are too
 small answer in prose without calling the tools.
 
@@ -383,8 +397,8 @@ tail ~/.bigbrain/maintenance.log
 ```
 
 A healthy pass ends with `ok`; a `skipped: neither claude nor cursor-agent is on PATH …`
-line means the installed worker is stale, Cursor Agent is not under `~/.local/bin`, and
-no direct-runner key was found either.
+line means the installed worker is stale or Cursor Agent is not under `~/.local/bin`
+(and `BIGBRAIN_MAINT_HOST=pi` was not set to opt into Pi).
 
 For Claude Code, verify its headless CLI separately:
 
@@ -401,7 +415,8 @@ The worker is tunable through the environment: `BIGBRAIN_MAINT_MODEL` (defaults 
 Claude Code, `composer-2.5` on Cursor — small models fail this task, answering in prose without
 calling the tools), `BIGBRAIN_MAINT_PI_MODEL` (the direct runner's model, kept separate
 because the host CLIs and Pi share no model ids), `BIGBRAIN_MAINT_HOST` (force
-`claude`, `cursor`, or `direct`), `BIGBRAIN_MAINT_TIMEOUT`, `BIGBRAIN_MAINT_LOG`,
+`claude`, `cursor`, `pi`, or `direct` — the last two are the only way Cursor / Claude Code
+ever use Pi or a raw model API), `BIGBRAIN_MAINT_TIMEOUT`, `BIGBRAIN_MAINT_LOG`,
 `BIGBRAIN_MAINT_MAX_CHARS`, `BIGBRAIN_MCP_URL`, and `BIGBRAIN_ENV_FILE`. Set
 `BIGBRAIN_MAINT_DRYRUN=1` to print the assembled prompt instead of running the pass; it works
 on the worker and on the direct runner alike.

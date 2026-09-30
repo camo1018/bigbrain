@@ -510,6 +510,14 @@ def _write_env_setting(key: str, value: str) -> str:
     return "updated"
 
 
+def _pi_backend_opted_in() -> bool:
+    """Whether Cursor / Claude Code were told to run the pass through Pi.
+
+    Pi is never a silent fallback for those hosts; it runs only with BIGBRAIN_MAINT_HOST=pi.
+    """
+    return (_read_env_setting("BIGBRAIN_MAINT_HOST") or "").strip().lower() == "pi"
+
+
 def _pi_pass_available() -> bool:
     """Whether the direct runner can run the pass through a headless Pi.
 
@@ -522,7 +530,10 @@ def _pi_pass_available() -> bool:
             Path.home() / ".pi" / "agent" / "extensions" / "bigbrain.ts",
         )
     ).expanduser()
-    return shutil.which("pi") is not None and extension.is_file()
+    pi_found = shutil.which("pi") is not None or (
+        Path.home() / ".pi" / "agent" / "bin" / "pi"
+    ).is_file()
+    return pi_found and extension.is_file()
 
 
 def _install_skills(dest_root: Path) -> list[str]:
@@ -565,9 +576,10 @@ def install_hooks(
         None,
         "--pi-model",
         help=(
-            "Model for the background memory pass, as Pi's `provider/id` (for example "
-            "google/gemini-3.7-flash). Written to ~/.bigbrain/env as "
-            "BIGBRAIN_MAINT_PI_MODEL. Unset: the pass uses the model of the Pi session."
+            "Model for the background memory pass when it runs through Pi, as Pi's "
+            "`provider/id`. Written to ~/.bigbrain/env as BIGBRAIN_MAINT_PI_MODEL. Used by "
+            "--target pi, and by Cursor / Claude Code only with BIGBRAIN_MAINT_HOST=pi. "
+            "Unset: the pass uses the model of the Pi session."
         ),
     ),
     with_skills: bool = typer.Option(
@@ -600,14 +612,23 @@ def install_hooks(
     else:
         _install_hook_host(target, spec, dest_root, default_root, src_hooks)
 
-    # The background pass runs through Pi for every host that falls back to the direct
-    # runner, so its model lives in the shared settings file rather than in Pi's config.
+    # The Pi model lives in the shared settings file rather than in Pi's config. It only
+    # matters where the pass actually runs through Pi: always for Pi, and for Cursor /
+    # Claude Code only when the user opted in with BIGBRAIN_MAINT_HOST=pi.
     env_file = _env_file()
+    uses_pi = target == "pi" or _pi_backend_opted_in()
     if pi_model:
         outcome = _write_env_setting("BIGBRAIN_MAINT_PI_MODEL", pi_model)
         console.print(
             f"[green]{outcome}[/green] BIGBRAIN_MAINT_PI_MODEL={pi_model} in {env_file}"
         )
+        if not uses_pi:
+            console.print(
+                f"[dim]{target} runs the pass on its own CLI; the Pi model applies only "
+                f"with BIGBRAIN_MAINT_HOST=pi in {env_file}.[/dim]"
+            )
+    elif not uses_pi:
+        pass
     elif current := _read_env_setting("BIGBRAIN_MAINT_PI_MODEL"):
         console.print(f"[dim]background pass model: {current} (from {env_file})[/dim]")
     else:
@@ -664,14 +685,24 @@ def _install_hook_host(
             "[yellow]warning:[/yellow] `jq` not found on PATH — the hook scripts "
             "require it at runtime. Install jq before relying on the hooks."
         )
-    if shutil.which(spec["cli"]) is None:
-        fallback_ok = shutil.which("node") is not None and _pi_pass_available()
-        status = "so the pass will run through Pi instead" if fallback_ok else (
-            "and the fallback runs the pass through Pi, which needs `node`, `pi`, and the "
-            "bigbrain Pi extension (`bigbrain install-hooks --target pi`)"
+    other_cli = "cursor-agent" if spec["cli"] == "claude" else "claude"
+    if _pi_backend_opted_in():
+        if shutil.which("node") is None or not _pi_pass_available():
+            err_console.print(
+                "[yellow]warning:[/yellow] BIGBRAIN_MAINT_HOST=pi is set, but running the "
+                "pass through Pi needs `node`, `pi`, and the bigbrain Pi extension "
+                "(`bigbrain install-hooks --target pi`). Until then the pass is skipped."
+            )
+    elif shutil.which(spec["cli"]) is None:
+        status = (
+            f"so the pass will run on `{other_cli}` instead"
+            if shutil.which(other_cli)
+            else "so the maintenance pass will be skipped (and logged) until it is installed"
         )
         err_console.print(
-            f"[yellow]note:[/yellow] `{spec['cli']}` not found on PATH, {status}."
+            f"[yellow]note:[/yellow] `{spec['cli']}` not found on PATH, {status}. "
+            "To run the pass through Pi instead, set BIGBRAIN_MAINT_HOST=pi in "
+            f"{_env_file()}."
         )
 
     dest_hooks = dest_root / "hooks"
