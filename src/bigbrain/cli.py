@@ -31,6 +31,7 @@ _HOOK_SCRIPTS = (
 )
 _DIRECT_RUNNER = "bigbrain-maintenance-direct.mjs"
 _PI_EXTENSION = "pi/bigbrain.ts"
+_PI_RUNNER_DIR = "bigbrain"
 _RULE_SOURCE = "bigbrain-memory.mdc"
 _SKILLS_DIR = "skills"
 _MCP_URL = "http://127.0.0.1:8765/mcp"
@@ -79,7 +80,8 @@ _TARGETS = {
         "cli": None,
         "reload_hint": "Run /reload in an open Pi session (or start a new one) to load the extension.",
         "mcp_hint": (
-            f"Nothing to register: the extension talks to {_MCP_URL} directly. "
+            f"Nothing to register: the extension talks to {_MCP_URL} directly, and the "
+            "maintenance pass runs through Pi's own model config (no API key). "
             "Just keep the server running (`uv run bigbrain install-server` on macOS)."
         ),
     },
@@ -441,7 +443,8 @@ def _merge_agents_md(path: Path, body: str) -> str:
     start = existing.find(_AGENTS_BEGIN)
     end = existing.find(_AGENTS_END)
     if start != -1 and end != -1 and end > start:
-        merged = existing[:start] + section + existing[end + len(_AGENTS_END):].lstrip("\n")
+        rest = existing[end + len(_AGENTS_END):].lstrip("\n")
+        merged = existing[:start] + section + ("\n" + rest if rest else "")
     else:
         merged = existing.rstrip("\n") + "\n\n" + section if existing.strip() else section
     if merged == existing:
@@ -451,15 +454,86 @@ def _merge_agents_md(path: Path, body: str) -> str:
     return "updated"
 
 
-def _api_key_available() -> bool:
-    """Whether the direct runner would find an LLM key in the env or ~/.bigbrain/env."""
-    if os.environ.get("GEMINI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"):
-        return True
-    env_file = Path(os.environ.get("BIGBRAIN_ENV_FILE", Config.from_env().home / "env"))
-    if not env_file.is_file():
-        return False
-    text = env_file.read_text()
-    return "GEMINI_API_KEY=" in text or "ANTHROPIC_API_KEY=" in text
+def _env_file() -> Path:
+    """The KEY=VALUE settings file the hook scripts and the direct runner read."""
+    return Path(os.environ.get("BIGBRAIN_ENV_FILE", Config.from_env().home / "env"))
+
+
+def _read_env_setting(key: str) -> Optional[str]:
+    """A setting from the environment, else from the settings file (as the runner reads it)."""
+    if os.environ.get(key):
+        return os.environ[key]
+    path = _env_file()
+    if not path.is_file():
+        return None
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        name, sep, value = line.partition("=")
+        if sep and name.strip() == key:
+            return value.strip().strip("\"'") or None
+    return None
+
+
+def _write_env_setting(key: str, value: str) -> str:
+    """Set KEY=VALUE in the settings file, keeping every other line.
+
+    Returns "created", "updated", or "unchanged". The file can hold API keys, so it is
+    kept private (0600, in a 0700 directory).
+    """
+    path = _env_file()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    new_line = f"{key}={value}"
+    if not path.exists():
+        path.write_text(
+            "# bigbrain settings, read by the memory-maintenance hooks and runner.\n"
+            f"{new_line}\n"
+        )
+        os.chmod(path, 0o600)
+        return "created"
+
+    lines = path.read_text().splitlines()
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if line.partition("=")[0].strip() == key and "=" in line:
+            if raw == new_line:
+                return "unchanged"
+            lines[i] = new_line
+            break
+    else:
+        lines.append(new_line)
+    path.write_text("\n".join(lines) + "\n")
+    os.chmod(path, 0o600)
+    return "updated"
+
+
+def _pi_backend_opted_in() -> bool:
+    """Whether Cursor / Claude Code were told to run the pass through Pi.
+
+    Pi is never a silent fallback for those hosts; it runs only with BIGBRAIN_MAINT_HOST=pi.
+    """
+    return (_read_env_setting("BIGBRAIN_MAINT_HOST") or "").strip().lower() == "pi"
+
+
+def _pi_pass_available() -> bool:
+    """Whether the direct runner can run the pass through a headless Pi.
+
+    That needs the `pi` CLI (the Pi extension hands the runner its own path, so this only
+    matters for runs started outside Pi) and the bigbrain extension the child Pi loads.
+    """
+    extension = Path(
+        os.environ.get(
+            "BIGBRAIN_MAINT_PI_EXTENSION",
+            Path.home() / ".pi" / "agent" / "extensions" / "bigbrain.ts",
+        )
+    ).expanduser()
+    pi_found = shutil.which("pi") is not None or (
+        Path.home() / ".pi" / "agent" / "bin" / "pi"
+    ).is_file()
+    return pi_found and extension.is_file()
 
 
 def _install_skills(dest_root: Path) -> list[str]:
@@ -498,6 +572,16 @@ def install_hooks(
     with_rule: bool = typer.Option(
         True, "--with-rule/--no-rule", help="Also install the bigbrain memory rule."
     ),
+    pi_model: Optional[str] = typer.Option(
+        None,
+        "--pi-model",
+        help=(
+            "Model for the background memory pass when it runs through Pi, as Pi's "
+            "`provider/id`. Written to ~/.bigbrain/env as BIGBRAIN_MAINT_PI_MODEL. Used by "
+            "--target pi, and by Cursor / Claude Code only with BIGBRAIN_MAINT_HOST=pi. "
+            "Unset: the pass uses the model of the Pi session."
+        ),
+    ),
     with_skills: bool = typer.Option(
         True, "--with-skills/--no-skills", help="Also install the bundled bigbrain skills."
     ),
@@ -527,6 +611,31 @@ def install_hooks(
         _install_pi(dest_root, src_hooks)
     else:
         _install_hook_host(target, spec, dest_root, default_root, src_hooks)
+
+    # The Pi model lives in the shared settings file rather than in Pi's config. It only
+    # matters where the pass actually runs through Pi: always for Pi, and for Cursor /
+    # Claude Code only when the user opted in with BIGBRAIN_MAINT_HOST=pi.
+    env_file = _env_file()
+    uses_pi = target == "pi" or _pi_backend_opted_in()
+    if pi_model:
+        outcome = _write_env_setting("BIGBRAIN_MAINT_PI_MODEL", pi_model)
+        console.print(
+            f"[green]{outcome}[/green] BIGBRAIN_MAINT_PI_MODEL={pi_model} in {env_file}"
+        )
+        if not uses_pi:
+            console.print(
+                f"[dim]{target} runs the pass on its own CLI; the Pi model applies only "
+                f"with BIGBRAIN_MAINT_HOST=pi in {env_file}.[/dim]"
+            )
+    elif not uses_pi:
+        pass
+    elif current := _read_env_setting("BIGBRAIN_MAINT_PI_MODEL"):
+        console.print(f"[dim]background pass model: {current} (from {env_file})[/dim]")
+    else:
+        console.print(
+            "[dim]background pass model: the Pi session's model. Pin one with "
+            f"--pi-model or BIGBRAIN_MAINT_PI_MODEL in {env_file}.[/dim]"
+        )
 
     if with_rule:
         src_rule = _REPO_ROOT / "rules" / _RULE_SOURCE
@@ -576,14 +685,24 @@ def _install_hook_host(
             "[yellow]warning:[/yellow] `jq` not found on PATH — the hook scripts "
             "require it at runtime. Install jq before relying on the hooks."
         )
-    if shutil.which(spec["cli"]) is None:
-        fallback_ok = shutil.which("node") is not None and _api_key_available()
-        status = "so the direct runner will handle the pass" if fallback_ok else (
-            "and the direct-runner fallback needs `node` plus GEMINI_API_KEY or "
-            "ANTHROPIC_API_KEY (in the environment or ~/.bigbrain/env)"
+    other_cli = "cursor-agent" if spec["cli"] == "claude" else "claude"
+    if _pi_backend_opted_in():
+        if shutil.which("node") is None or not _pi_pass_available():
+            err_console.print(
+                "[yellow]warning:[/yellow] BIGBRAIN_MAINT_HOST=pi is set, but running the "
+                "pass through Pi needs `node`, `pi`, and the bigbrain Pi extension "
+                "(`bigbrain install-hooks --target pi`). Until then the pass is skipped."
+            )
+    elif shutil.which(spec["cli"]) is None:
+        status = (
+            f"so the pass will run on `{other_cli}` instead"
+            if shutil.which(other_cli)
+            else "so the maintenance pass will be skipped (and logged) until it is installed"
         )
         err_console.print(
-            f"[yellow]note:[/yellow] `{spec['cli']}` not found on PATH, {status}."
+            f"[yellow]note:[/yellow] `{spec['cli']}` not found on PATH, {status}. "
+            "To run the pass through Pi instead, set BIGBRAIN_MAINT_HOST=pi in "
+            f"{_env_file()}."
         )
 
     dest_hooks = dest_root / "hooks"
@@ -616,31 +735,50 @@ def _install_hook_host(
         console.print(f"[dim]hooks already registered[/dim] in {config_path}")
 
 
+def _remove_legacy_pi_runner(dest_root: Path) -> None:
+    """Drop the runner older installs put in `<config>/hooks/`.
+
+    Pi treats any `hooks/` directory as a leftover from before extensions and blocks
+    startup with a warning, so remove the directory too once nothing else is in it.
+    """
+    legacy_dir = dest_root / "hooks"
+    legacy = legacy_dir / _DIRECT_RUNNER
+    if legacy.is_file():
+        legacy.unlink()
+        console.print(f"[green]removed legacy script[/green] {legacy}")
+    try:
+        legacy_dir.rmdir()
+    except OSError:
+        pass  # absent, or holds files that are not ours
+
+
 def _install_pi(dest_root: Path, src_hooks: Path) -> None:
     """Pi: install the extension and the direct runner it spawns.
 
-    Pi auto-discovers `extensions/*.ts`; the runner lives under `hooks/` so Pi does not
-    try to load it as an extension. The extension looks for the runner there first and
-    falls back to the stamped checkout path.
+    The runner performs the pass with a headless `pi -p` that loads only the bigbrain
+    extension, so it reuses Pi's configured providers and needs no separate API key.
+    Pi auto-discovers `extensions/*.ts` and warns about a legacy `hooks/` directory, so the
+    runner lives under `bigbrain/` instead. The extension looks for the runner there first
+    and falls back to the stamped checkout path.
     """
     if shutil.which("node") is None:
         err_console.print(
             "[yellow]warning:[/yellow] `node` not found on PATH — the Pi maintenance "
             "pass runs on Node.js (Pi itself needs it too)."
         )
-    if not _api_key_available():
+    if shutil.which("pi") is None:
         err_console.print(
-            "[yellow]note:[/yellow] no GEMINI_API_KEY or ANTHROPIC_API_KEY found. The "
-            "maintenance pass calls an LLM API directly; put the key in the environment "
-            "Pi runs in or in ~/.bigbrain/env (KEY=VALUE)."
+            "[yellow]note:[/yellow] `pi` is not on PATH here. That is fine inside Pi: the "
+            "extension hands the runner its own CLI path."
         )
 
-    dest_hooks = dest_root / "hooks"
-    dest_hooks.mkdir(parents=True, exist_ok=True)
-    runner = dest_hooks / _DIRECT_RUNNER
+    dest_runner_dir = dest_root / _PI_RUNNER_DIR
+    dest_runner_dir.mkdir(parents=True, exist_ok=True)
+    runner = dest_runner_dir / _DIRECT_RUNNER
     shutil.copyfile(src_hooks / _DIRECT_RUNNER, runner)
     os.chmod(runner, 0o755)
     console.print(f"[green]installed script[/green] {runner}")
+    _remove_legacy_pi_runner(dest_root)
 
     dest_ext = dest_root / "extensions"
     dest_ext.mkdir(parents=True, exist_ok=True)

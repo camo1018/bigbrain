@@ -28,6 +28,15 @@ from bigbrain.cli import (
 
 runner = CliRunner()
 
+
+@pytest.fixture(autouse=True)
+def isolated_env_file(tmp_path, monkeypatch):
+    """Keep every test away from the real ~/.bigbrain/env."""
+    env_file = tmp_path / "bigbrain-env"
+    monkeypatch.setenv("BIGBRAIN_ENV_FILE", str(env_file))
+    monkeypatch.delenv("BIGBRAIN_MAINT_PI_MODEL", raising=False)
+    return env_file
+
 TARGETS = ["cursor", "claude"]
 
 
@@ -151,9 +160,11 @@ def test_pi_installs_extension_runner_agents_and_skills(tmp_path):
 
     extension = tmp_path / "extensions" / "bigbrain.ts"
     assert extension.is_file()
-    runner_script = tmp_path / "hooks" / _DIRECT_RUNNER
+    runner_script = tmp_path / "bigbrain" / _DIRECT_RUNNER
     assert runner_script.is_file()
     assert os.stat(runner_script).st_mode & stat.S_IXUSR
+    # Pi warns on startup whenever <config>/hooks/ exists, so the install must not create it.
+    assert not (tmp_path / "hooks").exists()
     # Only the extension may live under extensions/: Pi loads everything there.
     assert [p.name for p in (tmp_path / "extensions").iterdir()] == ["bigbrain.ts"]
 
@@ -162,6 +173,27 @@ def test_pi_installs_extension_runner_agents_and_skills(tmp_path):
     assert "alwaysApply" not in body, "Cursor frontmatter leaked into AGENTS.md"
 
     assert (tmp_path / "skills" / "bigbrain-trim" / "SKILL.md").is_file()
+
+
+def test_pi_install_removes_legacy_hooks_runner(tmp_path):
+    legacy = tmp_path / "hooks" / _DIRECT_RUNNER
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("old runner\n")
+
+    install(tmp_path, "pi")
+    assert not (tmp_path / "hooks").exists()
+    assert (tmp_path / "bigbrain" / _DIRECT_RUNNER).is_file()
+
+
+def test_pi_install_keeps_foreign_files_in_hooks_dir(tmp_path):
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    (hooks_dir / _DIRECT_RUNNER).write_text("old runner\n")
+    (hooks_dir / "someone-elses.ts").write_text("// not ours\n")
+
+    install(tmp_path, "pi")
+    assert not (hooks_dir / _DIRECT_RUNNER).exists()
+    assert (hooks_dir / "someone-elses.ts").is_file()
 
 
 def test_pi_extension_has_repo_path_stamped(tmp_path):
@@ -203,3 +235,83 @@ def test_pi_opt_out_flags(tmp_path):
     assert not (tmp_path / "AGENTS.md").exists()
     assert not (tmp_path / "skills").exists()
     assert (tmp_path / "extensions" / "bigbrain.ts").is_file()
+
+
+def test_pi_install_does_not_demand_an_api_key(tmp_path, monkeypatch):
+    """With `pi` on PATH the pass runs on Pi's own providers, so no key note is printed."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("BIGBRAIN_ENV_FILE", str(tmp_path / "missing-env"))
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_pi = fake_bin / "pi"
+    fake_pi.write_text("#!/bin/sh\n")
+    fake_pi.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+
+    result = runner.invoke(
+        app, ["install-hooks", "--target", "pi", "--config-dir", str(tmp_path / "pi")]
+    )
+    assert result.exit_code == 0, result.output
+    assert "GEMINI_API_KEY" not in result.output
+
+
+def test_pi_extension_hands_runner_its_cli_and_model(tmp_path):
+    install(tmp_path, "pi")
+    text = (tmp_path / "extensions" / "bigbrain.ts").read_text()
+    for field in ("pi_cli", "pi_node", "pi_extension", "pi_model"):
+        assert field in text, f"payload field {field} missing"
+
+
+def test_pi_model_is_written_to_the_env_file(tmp_path, isolated_env_file):
+    install(tmp_path / "pi", "pi", "--pi-model", "gw/fast-model")
+    text = isolated_env_file.read_text()
+    assert "BIGBRAIN_MAINT_PI_MODEL=gw/fast-model" in text
+    assert stat.S_IMODE(os.stat(isolated_env_file).st_mode) == 0o600
+
+
+def test_pi_model_update_keeps_other_env_lines(tmp_path, isolated_env_file):
+    isolated_env_file.write_text(
+        "# mine\nGEMINI_API_KEY=abc\nexport BIGBRAIN_MAINT_PI_MODEL=old/model\nFOO=bar\n"
+    )
+    install(tmp_path / "pi", "pi", "--pi-model", "new/model")
+    lines = isolated_env_file.read_text().splitlines()
+    assert lines == ["# mine", "GEMINI_API_KEY=abc", "BIGBRAIN_MAINT_PI_MODEL=new/model", "FOO=bar"]
+
+    install(tmp_path / "pi", "pi", "--pi-model", "new/model")
+    assert isolated_env_file.read_text().splitlines() == lines
+
+
+def test_install_without_pi_model_leaves_env_file_alone(tmp_path, isolated_env_file):
+    install(tmp_path / "pi", "pi")
+    assert not isolated_env_file.exists()
+
+
+@pytest.mark.parametrize("target", TARGETS)
+def test_host_install_does_not_mention_the_pi_model(tmp_path, target):
+    """Cursor / Claude Code run the pass on their own CLI unless Pi is opted into."""
+    result = install(tmp_path, target)
+    assert "background pass model" not in result.output
+
+
+@pytest.mark.parametrize("target", TARGETS)
+def test_missing_host_cli_note_does_not_route_to_pi(tmp_path, target, monkeypatch):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_pi = fake_bin / "pi"
+    fake_pi.write_text("#!/bin/sh\n")
+    fake_pi.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))  # pi present, neither host CLI
+    result = install(tmp_path / "cfg", target)
+    assert "will be skipped" in result.output
+    assert "BIGBRAIN_MAINT_HOST=pi" in result.output
+    assert "run through Pi instead" not in result.output
+
+
+@pytest.mark.parametrize("target", TARGETS)
+def test_pi_opt_in_without_pi_warns(tmp_path, target, isolated_env_file, monkeypatch):
+    isolated_env_file.write_text("BIGBRAIN_MAINT_HOST=pi\n")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+    result = install(tmp_path / "cfg", target)
+    assert "BIGBRAIN_MAINT_HOST=pi is set" in result.output

@@ -1,33 +1,44 @@
 #!/usr/bin/env node
 // Standalone runner for the bigbrain memory-maintenance pass.
 //
-// Runs the recall -> decide -> store/replace loop by calling an LLM API directly and
-// executing its tool calls against the bigbrain MCP server over HTTP. No headless agent
-// CLI is involved, so this is what the Pi extension uses and what the Cursor / Claude Code
-// worker falls back to when neither `cursor-agent` nor `claude` is installed.
+// Runs the recall -> decide -> store/replace loop for one finished turn and executes the
+// model's tool calls against the bigbrain MCP server. This is what the Pi extension uses.
+// The Cursor / Claude Code worker runs it only when the user opts in with
+// BIGBRAIN_MAINT_HOST=pi (or =direct); it is never a silent fallback for those hosts.
 //
 // Usage: bigbrain-maintenance-direct.mjs <payload-file>
 //   The payload is JSON with `session_id` and `turn_text` (the rendered turn). The file is
 //   deleted once read.
 //
-// Providers (auto-selected from whichever key is set, Gemini first; override with
-// BIGBRAIN_MAINT_PROVIDER=gemini|anthropic):
-//   GEMINI_API_KEY      -> Gemini generateContent   (default model: gemini-3.7-flash)
-//   ANTHROPIC_API_KEY   -> Anthropic Messages API   (default model: claude-sonnet-5)
-// Keys are read from the environment first, then from ~/.bigbrain/env (KEY=VALUE lines),
-// because hooks launched by a GUI application do not inherit a shell profile.
+// Backend (BIGBRAIN_MAINT_PROVIDER, default: pi):
+//   pi         -> a headless `pi -p` run that reuses Pi's own configured providers and
+//                 credentials, so no API key is needed. Only the bigbrain extension is
+//                 loaded and only memory_recall / memory_store are enabled. Pi is found
+//                 via the CLI path in the payload (the Pi extension sends it) or on PATH.
+//   gemini     -> Gemini generateContent with GEMINI_API_KEY    (opt-in legacy backend)
+//   anthropic  -> Anthropic Messages API with ANTHROPIC_API_KEY (opt-in legacy backend)
+// The legacy backends are used only when selected explicitly; having a key set is not
+// enough.
 //
-// Environment overrides:
-//   BIGBRAIN_MAINT_DIRECT_MODEL  model id for the chosen provider
+// Settings are read from the environment first, then from ~/.bigbrain/env (KEY=VALUE
+// lines), because hooks launched by a GUI application do not inherit a shell profile.
+//   BIGBRAIN_MAINT_PI_MODEL      Pi model for the pass, as `provider/id` or any pattern
+//                                `pi --model` accepts (default: the model of the Pi
+//                                session that ran the turn, else Pi's default model)
+//   BIGBRAIN_MAINT_PI_THINKING   Pi thinking level for the pass (default: low)
+//   BIGBRAIN_MAINT_PI_EXTENSION  path to bigbrain.ts (default: ~/.pi/agent/extensions/bigbrain.ts)
+//   BIGBRAIN_MAINT_PROVIDER      pi | gemini | anthropic
+//   BIGBRAIN_MAINT_DIRECT_MODEL  model id for the gemini / anthropic backend
 //   BIGBRAIN_MAINT_TIMEOUT       wall-clock seconds for the whole pass (default: 300)
 //   BIGBRAIN_MAINT_LOG           log file (default: ~/.bigbrain/maintenance.log)
 //   BIGBRAIN_MCP_URL             bigbrain endpoint (default: http://127.0.0.1:8765/mcp)
-//   BIGBRAIN_ENV_FILE            env file to read keys from (default: ~/.bigbrain/env)
+//   BIGBRAIN_ENV_FILE            settings file (default: ~/.bigbrain/env)
 //   BIGBRAIN_MAINT_DRYRUN        print the provider and assembled prompt, then exit
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { homedir } from "node:os";
+import { spawn } from "node:child_process";
+import { delimiter, dirname, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
 
 const payloadPath = process.argv[2];
 if (!payloadPath) {
@@ -289,22 +300,135 @@ async function runAnthropic(fullPrompt, apiKey, model) {
 	return { result, tokensIn, tokensOut };
 }
 
+// ------------------------------------------------------------------------------- Pi
+
+// The pass needs only the bigbrain tools, so the child Pi loads nothing else: no other
+// extensions, skills, prompt templates, context files, or project-local resources, and it
+// saves no session.
+const PI_TOOLS = TOOLS.map((t) => t.name).join(",");
+
+function findOnPath(name) {
+	for (const dir of (process.env.PATH || "").split(delimiter)) {
+		if (dir && existsSync(join(dir, name))) return join(dir, name);
+	}
+	return null;
+}
+
+// Returns the argv prefix that launches Pi, or null. The Pi extension sends the CLI entry
+// point of the running Pi, which is exact even when `pi` is not on this process's PATH.
+function resolvePiCommand(payload) {
+	if (payload.pi_cli && existsSync(payload.pi_cli)) {
+		return [payload.pi_node && existsSync(payload.pi_node) ? payload.pi_node : process.execPath, payload.pi_cli];
+	}
+	const onPath = findOnPath("pi");
+	return onPath ? [onPath] : null;
+}
+
+function resolvePiExtension(payload) {
+	return [
+		process.env.BIGBRAIN_MAINT_PI_EXTENSION,
+		payload.pi_extension,
+		join(homedir(), ".pi", "agent", "extensions", "bigbrain.ts"),
+	].find((p) => p && existsSync(p)) || null;
+}
+
+async function runPi(fullPrompt, { command, extension, model }) {
+	const args = [
+		...command.slice(1),
+		"--print",
+		"--mode", "json",
+		"--no-session",
+		"--no-extensions", "--extension", extension,
+		"--tools", PI_TOOLS,
+		"--no-skills",
+		"--no-prompt-templates",
+		"--no-context-files",
+		"--no-approve",
+		"--offline",
+		"--thinking", process.env.BIGBRAIN_MAINT_PI_THINKING || "low",
+	];
+	if (model) args.push("--model", model);
+
+	// Drop the parent session's identity so the child cannot be mistaken for it.
+	const env = { ...process.env, BIGBRAIN_MAINT: "1" };
+	for (const key of Object.keys(env)) {
+		if (key.startsWith("PI_SESSION")) delete env[key];
+	}
+
+	return await new Promise((resolve, reject) => {
+		// The prompt goes in on stdin: a long turn can exceed the argv size limit.
+		const child = spawn(command[0], args, { cwd: tmpdir(), env, stdio: ["pipe", "pipe", "pipe"] });
+		const timer = setTimeout(() => {
+			child.kill("SIGKILL");
+			reject(new Error(`pi timed out after ${TIMEOUT_MS / 1000}s`));
+		}, remainingMs());
+
+		let stdout = "";
+		let stderr = "";
+		child.stdout.on("data", (d) => (stdout += d));
+		child.stderr.on("data", (d) => (stderr += d));
+		child.on("error", (err) => {
+			clearTimeout(timer);
+			reject(err);
+		});
+		child.on("close", (code) => {
+			clearTimeout(timer);
+			let result = "";
+			let usedModel = model || "default";
+			let tokensIn = 0;
+			let tokensOut = 0;
+			let toolCalls = 0;
+			let failure = "";
+			for (const line of stdout.split("\n")) {
+				let event;
+				try {
+					event = JSON.parse(line);
+				} catch {
+					continue;
+				}
+				const msg = event.type === "message_end" ? event.message : null;
+				if (!msg || msg.role !== "assistant") continue;
+				tokensIn += msg.usage?.input || 0;
+				tokensOut += msg.usage?.output || 0;
+				if (msg.provider && msg.model) usedModel = `${msg.provider}/${msg.model}`;
+				const blocks = Array.isArray(msg.content) ? msg.content : [];
+				toolCalls += blocks.filter((b) => b.type === "toolCall").length;
+				const text = blocks.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+				if (text) result = text;
+				if (msg.stopReason === "error" || msg.errorMessage) failure = msg.errorMessage || "model error";
+			}
+			if (code !== 0 || failure) {
+				const detail = failure || stderr.trim() || stdout.trim().slice(-300);
+				reject(new Error(`pi exited ${code}: ${detail}`));
+				return;
+			}
+			resolve({ result: result || "NOOP", tokensIn, tokensOut, model: usedModel, toolCalls });
+		});
+		child.stdin.end(fullPrompt);
+	});
+}
+
 // ------------------------------------------------------------------------------ main
 
-function pickProvider() {
-	const forced = process.env.BIGBRAIN_MAINT_PROVIDER;
-	const candidates = [
-		["gemini", process.env.GEMINI_API_KEY],
-		["anthropic", process.env.ANTHROPIC_API_KEY],
-	];
-	if (forced) {
-		const hit = candidates.find(([name]) => name === forced);
-		if (!hit) throw new Error(`unknown BIGBRAIN_MAINT_PROVIDER '${forced}' (gemini|anthropic)`);
-		if (!hit[1]) throw new Error(`BIGBRAIN_MAINT_PROVIDER=${forced} but its API key is not set`);
-		return { provider: forced, apiKey: hit[1] };
+function pickProvider(payload) {
+	const provider = (process.env.BIGBRAIN_MAINT_PROVIDER || "pi").trim().toLowerCase();
+	if (provider === "pi") {
+		const command = resolvePiCommand(payload);
+		if (!command) throw new Error("the pi CLI was not found (not in the payload, not on PATH)");
+		const extension = resolvePiExtension(payload);
+		if (!extension) {
+			throw new Error("bigbrain.ts was not found; run `bigbrain install-hooks --target pi`");
+		}
+		return { provider, pi: { command, extension } };
 	}
-	const hit = candidates.find(([, key]) => !!key);
-	return hit ? { provider: hit[0], apiKey: hit[1] } : null;
+	const keys = { gemini: process.env.GEMINI_API_KEY, anthropic: process.env.ANTHROPIC_API_KEY };
+	if (!(provider in keys)) {
+		throw new Error(`unknown BIGBRAIN_MAINT_PROVIDER '${provider}' (pi|gemini|anthropic)`);
+	}
+	if (!keys[provider]) {
+		throw new Error(`BIGBRAIN_MAINT_PROVIDER=${provider} but ${provider.toUpperCase()}_API_KEY is not set`);
+	}
+	return { provider, apiKey: keys[provider] };
 }
 
 async function main() {
@@ -338,31 +462,37 @@ async function main() {
 	loadEnvFile(ENV_FILE);
 	let chosen;
 	try {
-		chosen = pickProvider();
+		chosen = pickProvider(payload);
 	} catch (err) {
 		logNote(`session=${sessionId} skipped: ${err.message}`);
 		return;
 	}
-	if (!chosen) {
-		logNote(`session=${sessionId} skipped: no GEMINI_API_KEY or ANTHROPIC_API_KEY (set it in the environment or in ${ENV_FILE})`);
-		return;
-	}
 	const { provider, apiKey } = chosen;
-	const model = process.env.BIGBRAIN_MAINT_DIRECT_MODEL || DEFAULT_MODELS[provider];
+	const model = provider === "pi"
+		? process.env.BIGBRAIN_MAINT_PI_MODEL || payload.pi_model || ""
+		: process.env.BIGBRAIN_MAINT_DIRECT_MODEL || DEFAULT_MODELS[provider];
 	const fullPrompt = `${PROMPT_HEADER}${turnText}\n--- END TURN (untrusted) ---`;
 
 	if (process.env.BIGBRAIN_MAINT_DRYRUN) {
-		process.stdout.write(`provider=${provider} model=${model}\n${fullPrompt}\n`);
+		process.stdout.write(`provider=${provider} model=${model || "default"}\n${fullPrompt}\n`);
 		return;
 	}
 
 	const start = Date.now();
 	try {
-		const run = provider === "anthropic" ? runAnthropic : runGemini;
-		const res = await run(fullPrompt, apiKey, model);
+		let res;
+		let label;
+		if (provider === "pi") {
+			res = await runPi(fullPrompt, { ...chosen.pi, model });
+			label = `pi ${res.model} tools=${res.toolCalls}`;
+		} else {
+			const run = provider === "anthropic" ? runAnthropic : runGemini;
+			res = await run(fullPrompt, apiKey, model);
+			label = `${provider}/${model}`;
+		}
 		const elapsed = ((Date.now() - start) / 1000).toFixed(1);
 		const summary = res.result.replace(/\n+/g, " ").slice(0, 300);
-		logNote(`session=${sessionId} ok in ${elapsed}s ${provider}/${model} tokens=${res.tokensIn}in/${res.tokensOut}out :: ${summary}`);
+		logNote(`session=${sessionId} ok in ${elapsed}s ${label} tokens=${res.tokensIn}in/${res.tokensOut}out :: ${summary}`);
 	} catch (err) {
 		const elapsed = ((Date.now() - start) / 1000).toFixed(1);
 		logNote(`session=${sessionId} FAILED in ${elapsed}s ${provider}/${model}: ${err.message.replace(/\n+/g, " ").slice(0, 300)}`);
