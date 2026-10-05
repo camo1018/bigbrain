@@ -429,6 +429,17 @@ class MemoryStore:
 
     def close(self) -> None:
         if self._client is not None:
+            # Flush pending writes before tearing the client down. Milvus Lite
+            # buffers upserts and deletes in a WAL, and the server is released
+            # right after this (the MCP layer closes after every op). Flushing
+            # first is cheap and makes sure those writes are persisted rather
+            # than relying on WAL replay in the next process.
+            try:
+                self._client.flush(self.config.collection)
+            except Exception:
+                # Best effort: never let a flush failure mask the caller's
+                # error or keep the server (and its data-dir lock) held.
+                pass
             self._client.close()
             self._client = None
         _release_milvus_server()
