@@ -417,9 +417,22 @@ calling the tools), `BIGBRAIN_MAINT_PI_MODEL` (the direct runner's model, kept s
 because the host CLIs and Pi share no model ids), `BIGBRAIN_MAINT_HOST` (force
 `claude`, `cursor`, `pi`, or `direct` — the last two are the only way Cursor / Claude Code
 ever use Pi or a raw model API), `BIGBRAIN_MAINT_TIMEOUT`, `BIGBRAIN_MAINT_LOG`,
-`BIGBRAIN_MAINT_MAX_CHARS`, `BIGBRAIN_MCP_URL`, and `BIGBRAIN_ENV_FILE`. Set
+`BIGBRAIN_MAINT_MAX_CHARS`, `BIGBRAIN_MAINT_USER_CHARS`, `BIGBRAIN_MCP_URL`, and `BIGBRAIN_ENV_FILE`. Set
 `BIGBRAIN_MAINT_DRYRUN=1` to print the assembled prompt instead of running the pass; it works
 on the worker and on the direct runner alike.
+
+### What a pass reviews
+
+Each pass reviews everything since the previous pass, not just the messages after the last
+user prompt. That covers the original request when you steered the agent mid-run, and any
+earlier turn that was skipped because it used no tools. A per-session checkpoint under
+`$TMPDIR/bigbrain-hooks/` (`reviewed-<session>`; `reviewed-pi-<session>` on Pi) records
+where the last pass stopped. With no checkpoint (the first pass of a session, or after the
+day-old sweep), the window falls back to the last user prompt.
+
+User messages are clipped at `BIGBRAIN_MAINT_USER_CHARS` (default 16000) and assistant text
+at 4000. If the whole window exceeds `BIGBRAIN_MAINT_MAX_CHARS` (default 60000), tool
+arguments and results are dropped first. Only then is the middle cut.
 
 ## Trimming memory (`bigbrain-trim` skill)
 

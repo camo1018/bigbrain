@@ -12,6 +12,7 @@
 #   BIGBRAIN_MAINT_TIMEOUT    wall-clock seconds for the pass   (default: 300)
 #   BIGBRAIN_MAINT_LOG        log file                          (default: ~/.bigbrain/maintenance.log)
 #   BIGBRAIN_MAINT_MAX_CHARS  turn text budget                  (default: 60000)
+#   BIGBRAIN_MAINT_USER_CHARS per-user-message budget           (default: 16000)
 #   BIGBRAIN_MAINT_SETTLE     seconds to wait for transcript flush (default: 3)
 #   BIGBRAIN_MCP_URL          bigbrain MCP endpoint             (default: http://127.0.0.1:8765/mcp)
 #   BIGBRAIN_MAINT_DRYRUN     print the assembled prompt and exit without running it
@@ -41,6 +42,7 @@ trap 'rm -f "$payload_file"' EXIT
 budget="${BIGBRAIN_MAINT_TIMEOUT:-300}"
 log="${BIGBRAIN_MAINT_LOG:-$HOME/.bigbrain/maintenance.log}"
 max_chars="${BIGBRAIN_MAINT_MAX_CHARS:-60000}"
+user_chars="${BIGBRAIN_MAINT_USER_CHARS:-16000}"
 settle="${BIGBRAIN_MAINT_SETTLE:-3}"
 mcp_url="${BIGBRAIN_MCP_URL:-http://127.0.0.1:8765/mcp}"
 
@@ -178,9 +180,17 @@ fi
 # The transcript is flushed asynchronously and normally lags the end of the turn.
 sleep "$settle"
 
-# Render the messages of the turn that just ended: everything from the last real user
-# prompt onward. Tool payloads are clipped hard — the pass needs to know what was done,
-# not replay every byte of output. Claude Code marks the role in `type`, Cursor in
+# Render everything the previous pass has not seen. A checkpoint records how many
+# transcript entries the last pass read, so the window starts there and covers the whole
+# run: the original request, any message the user sent while the agent was working, and
+# any earlier turn the stop hook skipped. Transcript entries carry no reliable "new run"
+# marker (Cursor's are bare {role, message}), so the checkpoint is the only way to find
+# the start. With no checkpoint (first pass, or one swept as stale) the window falls back
+# to the last real user prompt, so a resumed session does not re-review its history.
+#
+# Tool payloads are clipped hard — the pass needs to know what was done, not replay every
+# byte of output. User text gets a much larger budget than assistant text: what the user
+# said is the part most worth remembering. Claude Code marks the role in `type`, Cursor in
 # `role`, and the block shapes are otherwise the same.
 read -r -d '' extract <<'JQ'
 def role: (.role // .type // "");
@@ -189,36 +199,73 @@ def blocks:
   | if ($c | type) == "string" then [{type: "text", text: $c}]
     elif ($c | type) == "array" then $c
     else [] end;
+def keep: (role == "user" or role == "assistant") and (.isMeta | not) and (.isSidechain | not);
 
-[ .[]
-  | select((role == "user" or role == "assistant")
-           and (.isMeta | not)
-           and (.isSidechain | not))
-] as $msgs
-| ([ range(0; $msgs | length) as $i
-     | select(($msgs[$i] | role) == "user" and ($msgs[$i] | blocks | any(.type == "text")))
-     | $i ] | last // 0) as $start
-| $msgs[$start:]
-| map(
-    . as $e
-    | blocks
-    | map(
-        if .type == "text" then ($e | role | ascii_upcase) + ": " + ((.text // "") | .[0:4000])
-        elif .type == "tool_use" then "TOOL " + (.name // "?") + " " + ((.input // {}) | tostring | .[0:500])
-        elif .type == "tool_result" then "RESULT " + ((.content // "") | tostring | .[0:600])
-        else empty end)
-    | join("\n"))
-| map(select(length > 0))
-| join("\n")
+length as $n
+| (if $off >= 0 and $off <= $n then $off else null end) as $from
+| [ (if $from == null then .[] else .[$from:][] end) | select(keep) ] as $msgs
+| (if $from != null then 0
+   else ([ range(0; $msgs | length) as $i
+           | select(($msgs[$i] | role) == "user" and ($msgs[$i] | blocks | any(.type == "text")))
+           | $i ] | last // 0) end) as $start
+| { n: $n,
+    turn: ($msgs[$start:]
+      | map(
+          . as $e
+          | ($e | role) as $r
+          | blocks
+          | map(
+              if .type == "text" then ($r | ascii_upcase) + ": "
+                + ((.text // "") | .[0:(if $r == "user" then $user_chars else 4000 end)])
+              elif .type == "tool_use" and $results then "TOOL " + (.name // "?") + " " + ((.input // {}) | tostring | .[0:500])
+              elif .type == "tool_use" then "TOOL " + (.name // "?")
+              elif .type == "tool_result" and $results then "RESULT " + ((.content // "") | tostring | .[0:600])
+              else empty end)
+          | join("\n"))
+      | map(select(length > 0))
+      | join("\n")) }
 JQ
 
-turn=""
-if [[ -n "$transcript" && -f "$transcript" ]]; then
-  turn=$(jq -rs "$extract" "$transcript" 2>/dev/null)
+safe_sid=$(printf '%s' "$sid" | tr -c 'A-Za-z0-9._-' '_')
+checkpoint="${TMPDIR:-/tmp}/bigbrain-hooks/reviewed-$safe_sid"
+off=-1
+if [[ -f "$checkpoint" ]]; then
+  saved=$(cat "$checkpoint" 2>/dev/null)
+  [[ "$saved" =~ ^[0-9]+$ ]] && off="$saved"
 fi
+
+render() {
+  jq -s --argjson off "$off" --argjson user_chars "$user_chars" --argjson results "$1" \
+    "$extract" "$transcript" 2>/dev/null
+}
+
+rendered=""
+if [[ -n "$transcript" && -f "$transcript" ]]; then
+  rendered=$(render true)
+fi
+turn=$(printf '%s' "$rendered" | jq -r '.turn // ""' 2>/dev/null)
+seen=$(printf '%s' "$rendered" | jq -r '.n // empty' 2>/dev/null)
 if [[ -z "$turn" ]]; then
-  note "session=$sid skipped: no usable transcript at '${transcript:-<none>}'"
+  if [[ -n "$seen" ]]; then
+    note "session=$sid skipped: nothing new since the last pass (entry $off)"
+  else
+    note "session=$sid skipped: no usable transcript at '${transcript:-<none>}'"
+  fi
   exit 0
+fi
+
+# A wider window can blow the budget. Tool output is the bulk and the least durable part,
+# so shed it before the middle-cut below starts eating messages.
+if (( ${#turn} > max_chars )); then
+  slim=$(render false | jq -r '.turn // ""' 2>/dev/null)
+  [[ -n "$slim" ]] && turn="$slim"
+fi
+
+# Advance the checkpoint now rather than after the pass, so a second stop arriving while
+# this pass runs does not re-read the same entries.
+if [[ -n "$seen" && -z "${BIGBRAIN_MAINT_DRYRUN:-}" ]]; then
+  mkdir -p "$(dirname "$checkpoint")"
+  printf '%s' "$seen" > "$checkpoint"
 fi
 
 # last_assistant_message comes straight from the payload and is authoritative; the
@@ -232,9 +279,11 @@ if (( ${#turn} > max_chars )); then
 fi
 
 read -r -d '' prompt <<'PROMPT'
-Automated bigbrain memory-maintenance pass. An agent session just finished a turn; that
-turn's messages follow. No human reads your prose output, so spend the effort on the
-memory store rather than on a summary.
+Automated bigbrain memory-maintenance pass. An agent session just finished a turn; the
+messages since the previous pass follow (this can span several user messages). No human
+reads your prose output, so spend the effort on the memory store rather than on a summary.
+Pay particular attention to what the USER said: stated preferences, decisions, and
+corrections are durable even when no tool was involved.
 
 Decide whether the turn produced a durable, reusable learning worth remembering later:
   - an environment or infra gotcha and the fix for it

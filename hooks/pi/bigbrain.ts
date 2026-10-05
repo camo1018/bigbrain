@@ -19,7 +19,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -27,6 +27,16 @@ import { fileURLToPath } from "node:url";
 const MCP_URL = process.env.BIGBRAIN_URL || process.env.BIGBRAIN_MCP_URL || "http://127.0.0.1:8765/mcp";
 const HOOK_DIR = join(tmpdir(), "bigbrain-hooks");
 const LOG_FILE = process.env.BIGBRAIN_MAINT_LOG || join(homedir(), ".bigbrain", "maintenance.log");
+
+// Budgets for the rendered window. User text gets far more room than assistant text: what
+// the user said is the part most worth remembering, and it is usually short anyway.
+function envInt(name: string, fallback: number): number {
+	const n = Number.parseInt(process.env[name] ?? "", 10);
+	return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+const MAX_CHARS = envInt("BIGBRAIN_MAINT_MAX_CHARS", 60000);
+const USER_CHARS = envInt("BIGBRAIN_MAINT_USER_CHARS", 16000);
+const ASSISTANT_CHARS = 4000;
 
 // The installer copies the runner next to this extension's config tree and stamps the
 // checkout path as a fallback, so a fresh machine needs no hard-coded location.
@@ -155,99 +165,120 @@ async function callMcpTool(name: string, args: Record<string, unknown>, signal?:
 	}
 }
 
-function extractLastTurn(ctx: ExtensionContext): { turnText: string; hasTools: boolean } {
-	const entries = ctx.sessionManager.getBranch();
-	const msgs: any[] = [];
+// The last session entry a pass has covered, per session, so the next pass starts right
+// after it. Kept on disk so it survives /reload and resuming the session.
+function checkpointFile(sessionId: string): string {
+	return join(HOOK_DIR, `reviewed-pi-${sessionId.replace(/[^A-Za-z0-9._-]/g, "_")}`);
+}
 
-	for (const entry of entries) {
-		if (entry.type === "message" && entry.message) {
-			msgs.push(entry.message);
-		}
+function readCheckpoint(sessionId: string): string | null {
+	try {
+		return readFileSync(checkpointFile(sessionId), "utf8").trim() || null;
+	} catch {
+		return null;
 	}
+}
 
-	if (msgs.length === 0) {
-		return { turnText: "", hasTools: false };
+function writeCheckpoint(sessionId: string, entryId: string) {
+	try {
+		mkdirSync(HOOK_DIR, { recursive: true });
+		writeFileSync(checkpointFile(sessionId), entryId);
+	} catch {
+		// A lost checkpoint only means the next pass falls back to the last user prompt.
 	}
+}
 
-	// Find the last real user prompt with text content
-	let lastUserIndex = -1;
-	for (let i = msgs.length - 1; i >= 0; i--) {
-		const m = msgs[i];
-		if (m.role === "user") {
-			if (typeof m.content === "string" && m.content.trim()) {
-				lastUserIndex = i;
-				break;
-			}
-			if (Array.isArray(m.content) && m.content.some((c: any) => c.type === "text" && c.text.trim())) {
-				lastUserIndex = i;
-				break;
-			}
-		}
-	}
+function textOf(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((c: any) => c?.type === "text" && typeof c.text === "string")
+		.map((c: any) => c.text)
+		.join("\n");
+}
 
-	if (lastUserIndex === -1) {
-		lastUserIndex = 0;
-	}
-
-	const turnMsgs = msgs.slice(lastUserIndex);
+function render(msgs: any[], withTools: boolean): { text: string; hasTools: boolean } {
 	let hasTools = false;
 	const lines: string[] = [];
 
-	for (const m of turnMsgs) {
+	for (const m of msgs) {
 		if (m.role === "user") {
-			let text = "";
-			if (typeof m.content === "string") {
-				text = m.content;
-			} else if (Array.isArray(m.content)) {
-				text = m.content
-					.filter((c: any) => c.type === "text")
-					.map((c: any) => c.text)
-					.join("\n");
-			}
+			const text = textOf(m.content);
 			if (text.trim()) {
-				lines.push(`USER: ${text.slice(0, 4000)}`);
+				lines.push(`USER: ${text.slice(0, USER_CHARS)}`);
 			}
 		} else if (m.role === "assistant") {
 			if (Array.isArray(m.content)) {
 				for (const block of m.content) {
 					if (block.type === "text" && block.text?.trim()) {
-						lines.push(`ASSISTANT: ${block.text.slice(0, 4000)}`);
+						lines.push(`ASSISTANT: ${block.text.slice(0, ASSISTANT_CHARS)}`);
 					} else if (block.type === "toolCall") {
 						hasTools = true;
-						const argsStr = JSON.stringify(block.arguments || {});
-						lines.push(`TOOL ${block.name || "?"} ${argsStr.slice(0, 500)}`);
+						const argsStr = withTools ? " " + JSON.stringify(block.arguments || {}).slice(0, 500) : "";
+						lines.push(`TOOL ${block.name || "?"}${argsStr}`);
 					}
 				}
-			} else if (typeof m.content === "string" && (m.content as string).trim()) {
-				lines.push(`ASSISTANT: ${(m.content as string).slice(0, 4000)}`);
+			} else if (typeof m.content === "string" && m.content.trim()) {
+				lines.push(`ASSISTANT: ${m.content.slice(0, ASSISTANT_CHARS)}`);
 			}
 		} else if (m.role === "toolResult") {
 			hasTools = true;
-			let text = "";
-			if (typeof m.content === "string") {
-				text = m.content;
-			} else if (Array.isArray(m.content)) {
-				text = m.content
-					.filter((c: any) => c.type === "text")
-					.map((c: any) => c.text)
-					.join("\n");
-			}
-			if (text.trim()) {
+			const text = textOf(m.content);
+			if (withTools && text.trim()) {
 				lines.push(`RESULT ${text.slice(0, 600)}`);
 			}
 		} else if (m.role === "bashExecution") {
 			hasTools = true;
 			lines.push(`TOOL bash ${JSON.stringify({ command: m.command }).slice(0, 500)}`);
-			if (m.output?.trim()) {
+			if (withTools && m.output?.trim()) {
 				lines.push(`RESULT ${m.output.slice(0, 600)}`);
 			}
 		}
 	}
 
-	return {
-		turnText: lines.join("\n"),
-		hasTools,
-	};
+	return { text: lines.join("\n"), hasTools };
+}
+
+// Render everything since the previous pass: the whole run, including the original request
+// and any message the user sent while the agent was working, plus any earlier turn that
+// was skipped. With no usable checkpoint (first pass, or the checkpoint is on another
+// /tree branch) it falls back to the last real user prompt, so a resumed session does not
+// re-review its whole history.
+function extractPendingTurns(ctx: ExtensionContext, sessionId: string): { turnText: string; hasTools: boolean; lastEntryId: string | null } {
+	const entries = ctx.sessionManager.getBranch().filter((e: any) => e.type === "message" && e.message);
+	if (entries.length === 0) {
+		return { turnText: "", hasTools: false, lastEntryId: null };
+	}
+	const lastEntryId = entries[entries.length - 1].id;
+
+	let start = -1;
+	const checkpoint = readCheckpoint(sessionId);
+	if (checkpoint) {
+		const at = entries.findIndex((e: any) => e.id === checkpoint);
+		if (at !== -1) start = at + 1;
+	}
+	if (start === -1) {
+		start = 0;
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const m = (entries[i] as any).message;
+			if (m.role === "user" && textOf(m.content).trim()) {
+				start = i;
+				break;
+			}
+		}
+	}
+
+	const msgs = entries.slice(start).map((e: any) => e.message);
+	let { text, hasTools } = render(msgs, true);
+	// A wider window can blow the budget. Tool output is the bulk and the least durable
+	// part, so shed it first; only then cut the middle, keeping the start of the window.
+	if (text.length > MAX_CHARS) {
+		text = render(msgs, false).text;
+	}
+	if (text.length > MAX_CHARS) {
+		text = `${text.slice(0, 2000)}\n\n[... middle of turn omitted ...]\n\n${text.slice(-(MAX_CHARS - 2000))}`;
+	}
+	return { turnText: text, hasTools, lastEntryId };
 }
 
 function triggerDetachedMaintenance(ctx: ExtensionContext) {
@@ -256,13 +287,14 @@ function triggerDetachedMaintenance(ctx: ExtensionContext) {
 		return;
 	}
 
-	const { turnText, hasTools } = extractLastTurn(ctx);
-	// Only run maintenance for substantive turns (at least one tool executed or substantive content)
+	const sessionId = ctx.sessionManager.getSessionId() || "pi-session";
+	const { turnText, hasTools, lastEntryId } = extractPendingTurns(ctx, sessionId);
+	// Only run maintenance for substantive turns (at least one tool executed). A skipped
+	// turn leaves the checkpoint alone, so the next pass still covers it.
 	if (!hasTools || !turnText.trim()) {
 		return;
 	}
 
-	const sessionId = ctx.sessionManager.getSessionId() || "pi-session";
 	const runner = resolveRunner();
 	if (!runner) {
 		logNote(`session=${sessionId} skipped: direct runner not found (tried ${RUNNER_CANDIDATES.join(", ")})`);
@@ -295,6 +327,8 @@ function triggerDetachedMaintenance(ctx: ExtensionContext) {
 		});
 
 		child.unref();
+		// Advance only once the pass is handed off, so a failed spawn is retried next time.
+		if (lastEntryId) writeCheckpoint(sessionId, lastEntryId);
 	} catch (err: any) {
 		// A failed trigger must never crash the interactive session.
 		logNote(`session=${sessionId} FAILED to spawn direct runner: ${err?.message || String(err)}`);
