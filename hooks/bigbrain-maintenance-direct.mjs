@@ -161,9 +161,11 @@ const TOOLS = [
 	},
 ];
 
-const PROMPT_HEADER = `Automated bigbrain memory-maintenance pass. An agent session just finished a turn; that
-turn's messages follow. No human reads your prose output, so spend the effort on the
-memory store rather than on a summary.
+const PROMPT_HEADER = `Automated bigbrain memory-maintenance pass. An agent session just finished a turn; the
+messages since the previous pass follow (this can span several user messages). No human
+reads your prose output, so spend the effort on the memory store rather than on a summary.
+Pay particular attention to what the USER said: stated preferences, decisions, and
+corrections are durable even when no tool was involved.
 
 Decide whether the turn produced a durable, reusable learning worth remembering later:
   - an environment or infra gotcha and the fix for it
