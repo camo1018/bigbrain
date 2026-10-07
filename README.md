@@ -23,9 +23,15 @@ most relevant, fresh, and important knowledge surfaces first.
 ### What "rich" scope includes
 
 - `store` / `recall` / `get` / `list` / `update` / `delete` / `count`
-- **Dedup-merge:** storing a near-identical topic (cosine ≥ `0.92`) merges into the
-  existing memory instead of creating a duplicate (`on_conflict`: `merge` | `replace`
-  | `skip` | `new`).
+- **Dedup-merge:** storing a near-identical topic (cosine ≥ `0.92`) updates the
+  existing memory instead of creating a duplicate (`on_conflict`: `auto` | `merge` |
+  `replace` | `skip` | `new`). The default `auto` appends only while the entry is under
+  16,000 chars; past that it writes nothing and returns `needs_rewrite`, so the caller
+  re-stores a compacted version with `replace`. `merge` always appends.
+- **Size limit:** `content` is a Milvus `VARCHAR(65535)` (the Milvus maximum, counted
+  in UTF-8 bytes). A write over it raises `ContentTooLargeError` (MCP returns
+  `{"action": "rejected", "error": "content_too_large"}`) instead of a raw Milvus
+  error.
 - **Recency + importance reranking:** vector candidates are reranked by
   `0.6·similarity + 0.25·recency + 0.15·importance` (recency decays with a 30-day
   half-life). All weights are configurable via env vars.
@@ -436,8 +442,10 @@ arguments and results are dropped first. Only then is the middle cut.
 
 ## Trimming memory (`bigbrain-trim` skill)
 
-The hook *appends* learnings, and store-time dedup only merges near-identical topics — so over
-time the store accumulates append-churned entries and silent duplicates. The bundled
+The hook is told to rewrite entries in place, and `auto` refuses to grow an entry past 16,000
+chars, but older entries were built by appending and store-time dedup only merges
+near-identical topics — so the store can still accumulate append-churned entries and silent
+duplicates. The bundled
 [`bigbrain-trim`](skills/bigbrain-trim/SKILL.md) skill is an **on-demand, destructive**
 maintenance pass that compacts append-churned memories to current-truth, consolidates
 duplicates, evicts dead weight, and tidies tags — always behind an explicit approval gate. It

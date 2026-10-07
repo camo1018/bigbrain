@@ -366,14 +366,14 @@ export default function bigbrainExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "memory_store",
 		label: "Memory Store",
-		description: "Store a durable piece of knowledge in long-term memory. `topic` is a short semantic key (it becomes the searchable embedding); `content` is the detailed knowledge. Near-duplicate topics are merged by default so the same fact is not stored twice. Use this to remember decisions, facts, preferences, and learnings worth recalling later.",
+		description: "Store a durable piece of knowledge in long-term memory. `topic` is a short semantic key (it becomes the searchable embedding); `content` is the detailed knowledge. A near-duplicate topic updates the existing memory instead of creating a duplicate. Use this to remember decisions, facts, preferences, and learnings worth recalling later. If the result's action is 'needs_rewrite', nothing was written: the existing entry is too large to keep appending to, so re-store the same topic with on_conflict='replace' and a compact current-truth rewrite that folds in the new learning.",
 		parameters: Type.Object({
 			topic: Type.String({ description: "Short, descriptive, searchable key (becomes the embedding)" }),
 			content: Type.String({ description: "Full detail, self-contained knowledge" }),
 			tags: Type.Optional(Type.Array(Type.String(), { description: "Lowercase, reusable tags" })),
 			source: Type.Optional(Type.String({ description: "Source of the knowledge", default: "" })),
 			importance: Type.Optional(Type.Number({ description: "Importance score 0.0 - 1.0 (default 0.5)", default: 0.5 })),
-			on_conflict: Type.Optional(Type.String({ description: "'merge' (append), 'replace' (overwrite), 'skip', or 'new'", default: "merge" })),
+			on_conflict: Type.Optional(Type.String({ description: "'auto' (append while small, else ask for a rewrite), 'replace' (overwrite with this content), 'merge' (always append), 'skip', or 'new'", default: "auto" })),
 			dedup: Type.Optional(Type.Boolean({ description: "Whether to deduplicate against similar topics", default: true })),
 		}),
 		async execute(_toolCallId, params, signal) {

@@ -20,8 +20,11 @@ entry. Every write is preceded by a recall and a decision:
    - **Nothing related** → `memory_store` a fresh entry.
    - **A related entry exists** (still true, or stale/wrong) → update it in
      place: re-`memory_store` with the *same topic phrasing* and
-     `on_conflict="replace"` (overwrites) or `"merge"` (appends). Add/refresh
-     only what changed; keep it self-contained. Prefer this over `memory_update`
+     `on_conflict="replace"`, passing a rewrite that folds the new facts into the
+     existing content (keep what is still true, drop what is superseded) rather
+     than stacking addenda. `on_conflict="auto"` (the default) appends only while
+     the entry is small; if it returns `needs_rewrite`, nothing was written, so
+     rewrite and store again with `"replace"`. Keep it self-contained. Prefer this over `memory_update`
      by numeric id, because ids can exceed JavaScript's safe-integer range and
      round-trip lossily through some MCP transports, silently targeting the
      wrong entry.

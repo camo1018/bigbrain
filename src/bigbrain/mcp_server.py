@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional, TypeVar, Union
 from mcp.server.fastmcp import FastMCP
 
 from .config import Config
+from .store import REWRITE_THRESHOLD_CHARS, ContentTooLargeError
 
 _config = Config.from_env()
 
@@ -93,14 +94,29 @@ def _release_after(fn: _F) -> _F:
     return wrapper  # type: ignore[return-value]
 
 
+_REWRITE_HINT = (
+    "Not written: this memory is past the append threshold "
+    f"({REWRITE_THRESHOLD_CHARS} chars). Re-store the same topic with "
+    "on_conflict='replace' and content that merges your new learning into a "
+    "compact current-truth rewrite of the existing content (keep live facts, "
+    "drop superseded history)."
+)
+
+
 @mcp.tool(
     description=(
         "Store a durable piece of knowledge in long-term memory. `topic` is a "
         "short semantic key (it becomes the searchable embedding); `content` is "
-        "the detailed knowledge. Near-duplicate topics are merged by default so "
-        "the same fact is not stored twice. Use this to remember decisions, "
-        "facts, preferences, and learnings worth recalling later. Returns the "
-        "stored memory and the action taken (created/merged/replaced/skipped)."
+        "the detailed knowledge. A near-duplicate topic updates the existing "
+        "memory: on_conflict='auto' (default) appends while the entry is small, "
+        "'replace' overwrites it with the content you pass, 'merge' always appends, "
+        "'skip' leaves it, 'new' stores a separate entry. Returns the memory and "
+        "the action taken (created/merged/replaced/skipped). If the action is "
+        "'needs_rewrite', NOTHING was written: the existing entry is too large to "
+        "keep appending to, so re-store the same topic with on_conflict='replace' "
+        "and content that folds the new learning into a compact current-truth "
+        "rewrite of the returned memory. An action of 'rejected' means the content "
+        "exceeds the hard size limit."
     )
 )
 @_release_after
@@ -110,19 +126,25 @@ def memory_store(
     tags: Optional[list[str]] = None,
     source: str = "",
     importance: float = 0.5,
-    on_conflict: str = "merge",
+    on_conflict: str = "auto",
     dedup: bool = True,
 ) -> dict[str, Any]:
-    mem, action = store().store(
-        topic,
-        content,
-        tags=tags or [],
-        source=source,
-        importance=importance,
-        on_conflict=on_conflict,  # type: ignore[arg-type]
-        dedup=dedup,
-    )
-    return {"action": action, "memory": _wire(mem)}
+    try:
+        mem, action = store().store(
+            topic,
+            content,
+            tags=tags or [],
+            source=source,
+            importance=importance,
+            on_conflict=on_conflict,  # type: ignore[arg-type]
+            dedup=dedup,
+        )
+    except ContentTooLargeError as err:
+        return {"action": "rejected", "error": "content_too_large", "detail": str(err)}
+    result: dict[str, Any] = {"action": action, "memory": _wire(mem)}
+    if action == "needs_rewrite":
+        result["hint"] = _REWRITE_HINT
+    return result
 
 
 @mcp.tool(
@@ -198,14 +220,17 @@ def memory_update(
     source: Optional[str] = None,
     importance: Optional[float] = None,
 ) -> Optional[dict[str, Any]]:
-    mem = store().update(
-        _parse_id(memory_id),
-        topic=topic,
-        content=content,
-        tags=tags,
-        source=source,
-        importance=importance,
-    )
+    try:
+        mem = store().update(
+            _parse_id(memory_id),
+            topic=topic,
+            content=content,
+            tags=tags,
+            source=source,
+            importance=importance,
+        )
+    except ContentTooLargeError as err:
+        return {"action": "rejected", "error": "content_too_large", "detail": str(err)}
     return _wire(mem) if mem else None
 
 

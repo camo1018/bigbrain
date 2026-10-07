@@ -26,7 +26,10 @@ cross-memory consolidation**. So two things bloat the store:
 
 1. **Append-churn.** `on_conflict="merge"` and the maintenance hook *append*
    (`=== ADDENDUM ===`, `SUPERSEDES`, `CORRECTION`, `AS-BUILT`). Big memories
-   grow monotonically as stacked, partly-obsolete corrections.
+   grow monotonically as stacked, partly-obsolete corrections. (`auto`, the
+   default, now stops appending past 16,000 chars and returns `needs_rewrite`,
+   but entries built before that, or written with explicit `merge`, still need
+   compaction. Content has a hard 65,535-byte cap.)
 2. **Silent duplicates.** Same-subject memories phrased differently stay below
    the 0.92 auto-merge threshold and coexist.
 

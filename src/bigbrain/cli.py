@@ -20,7 +20,7 @@ from rich.table import Table
 
 from . import sync as sync_mod
 from .config import Config
-from .store import MemoryStore
+from .store import REWRITE_THRESHOLD_CHARS, ContentTooLargeError, MemoryStore
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HOOK_SCRIPTS = (
@@ -127,24 +127,41 @@ def store(
     source: str = typer.Option("", "--source", "-s", help="Where this came from."),
     importance: float = typer.Option(0.5, "--importance", "-i", min=0.0, max=1.0),
     on_conflict: str = typer.Option(
-        "merge", "--on-conflict", help="merge | replace | skip | new"
+        "auto", "--on-conflict", help="auto | merge | replace | skip | new"
     ),
     no_dedup: bool = typer.Option(False, "--no-dedup", help="Always insert a new memory."),
 ) -> None:
     """Store a memory (auto-merges near-duplicate topics)."""
     s = _store()
-    mem, action = s.store(
-        topic,
-        content,
-        tags=_parse_tags(tags),
-        source=source,
-        importance=importance,
-        on_conflict=on_conflict,  # type: ignore[arg-type]
-        dedup=not no_dedup,
-    )
-    color = {"created": "green", "merged": "yellow", "replaced": "yellow", "skipped": "dim"}
+    try:
+        mem, action = s.store(
+            topic,
+            content,
+            tags=_parse_tags(tags),
+            source=source,
+            importance=importance,
+            on_conflict=on_conflict,  # type: ignore[arg-type]
+            dedup=not no_dedup,
+        )
+    except ContentTooLargeError as err:
+        console.print(f"[red]rejected[/] {err}")
+        raise typer.Exit(1)
+    finally:
+        s.close()
+    color = {
+        "created": "green",
+        "merged": "yellow",
+        "replaced": "yellow",
+        "skipped": "dim",
+        "needs_rewrite": "red",
+    }
     console.print(f"[{color.get(action, 'white')}]{action}[/] id={mem.id}  topic={mem.topic!r}")
-    s.close()
+    if action == "needs_rewrite":
+        console.print(
+            f"nothing written: the existing memory is over {REWRITE_THRESHOLD_CHARS} chars; "
+            "re-run with --on-conflict replace and a compacted rewrite"
+        )
+        raise typer.Exit(2)
 
 
 @app.command()
