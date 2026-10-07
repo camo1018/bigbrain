@@ -297,8 +297,13 @@ If nothing durable emerged, do nothing at all and reply with exactly: NOOP
 Otherwise run the core loop:
   1. memory_recall the topic first, to see what already exists.
   2. If a related entry exists, update it in place: memory_store again with the SAME topic
-     phrasing and on_conflict="replace" (or "merge" to append). Do not create a
-     near-duplicate, and do not use memory_update by numeric id.
+     phrasing and on_conflict="replace", passing a REWRITE of the existing content that
+     folds the new learning in (keep facts that are still true, drop superseded detail).
+     Do not just append "ADDENDUM"/"CORRECTION" blocks: entries that only grow become
+     unreadable and eventually exceed the store's size limit. on_conflict="auto" is fine
+     for a short addition to a small entry; if a store returns action "needs_rewrite",
+     nothing was written, so rewrite and store again with on_conflict="replace".
+     Do not create a near-duplicate, and do not use memory_update by numeric id.
   3. Only memory_store a fresh entry when nothing related exists.
 
 Write content that stands on its own, with no references to "this session" or "the chat".

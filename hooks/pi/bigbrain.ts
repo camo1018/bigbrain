@@ -366,14 +366,14 @@ export default function bigbrainExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "memory_store",
 		label: "Memory Store",
-		description: "Store a durable piece of knowledge in long-term memory. `topic` is a short semantic key (it becomes the searchable embedding); `content` is the detailed knowledge. Near-duplicate topics are merged by default so the same fact is not stored twice. Use this to remember decisions, facts, preferences, and learnings worth recalling later.",
+		description: "Store a durable piece of knowledge in long-term memory. `topic` is a short semantic key (it becomes the searchable embedding); `content` is the detailed knowledge. A near-duplicate topic updates the existing memory instead of creating a duplicate. Use this to remember decisions, facts, preferences, and learnings worth recalling later. If the result's action is 'needs_rewrite', nothing was written: the existing entry is too large to keep appending to, so re-store the same topic with on_conflict='replace' and a compact current-truth rewrite that folds in the new learning.",
 		parameters: Type.Object({
 			topic: Type.String({ description: "Short, descriptive, searchable key (becomes the embedding)" }),
 			content: Type.String({ description: "Full detail, self-contained knowledge" }),
 			tags: Type.Optional(Type.Array(Type.String(), { description: "Lowercase, reusable tags" })),
 			source: Type.Optional(Type.String({ description: "Source of the knowledge", default: "" })),
 			importance: Type.Optional(Type.Number({ description: "Importance score 0.0 - 1.0 (default 0.5)", default: 0.5 })),
-			on_conflict: Type.Optional(Type.String({ description: "'merge' (append), 'replace' (overwrite), 'skip', or 'new'", default: "merge" })),
+			on_conflict: Type.Optional(Type.String({ description: "'auto' (append while small, else ask for a rewrite), 'replace' (overwrite with this content), 'merge' (always append), 'skip', or 'new'", default: "auto" })),
 			dedup: Type.Optional(Type.Boolean({ description: "Whether to deduplicate against similar topics", default: true })),
 		}),
 		async execute(_toolCallId, params, signal) {
@@ -391,7 +391,7 @@ export default function bigbrainExtension(pi: ExtensionAPI) {
 		label: "Memory Get",
 		description: "Fetch a single memory by its id. Returns null if not found.",
 		parameters: Type.Object({
-			memory_id: Type.Integer({ description: "ID of the memory to fetch" }),
+			memory_id: Type.String({ description: "ID of the memory to fetch, as a string (ids exceed JS safe-integer range)" }),
 		}),
 		async execute(_toolCallId, params, signal) {
 			const res = await callMcpTool("memory_get", params, signal);
@@ -428,7 +428,7 @@ export default function bigbrainExtension(pi: ExtensionAPI) {
 		label: "Memory Update",
 		description: "Update fields of an existing memory by id. Only provided fields change; changing the topic re-embeds the search key.",
 		parameters: Type.Object({
-			memory_id: Type.Integer({ description: "ID of the memory to update" }),
+			memory_id: Type.String({ description: "ID of the memory to update, as a string (ids exceed JS safe-integer range)" }),
 			topic: Type.Optional(Type.String({ description: "New topic" })),
 			content: Type.Optional(Type.String({ description: "New content" })),
 			tags: Type.Optional(Type.Array(Type.String(), { description: "New tags" })),
@@ -448,9 +448,9 @@ export default function bigbrainExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "memory_delete",
 		label: "Memory Delete",
-		description: "Delete one or more memories by id. Returns the number deleted.",
+		description: "Delete one or more memories by id. Returns the number that actually existed and were deleted.",
 		parameters: Type.Object({
-			memory_ids: Type.Array(Type.Integer(), { description: "List of memory IDs to delete" }),
+			memory_ids: Type.Array(Type.String(), { description: "List of memory IDs to delete, as strings (ids exceed JS safe-integer range)" }),
 		}),
 		async execute(_toolCallId, params, signal) {
 			const res = await callMcpTool("memory_delete", params, signal);

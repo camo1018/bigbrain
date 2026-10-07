@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import functools
 import threading
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar, Union
 
 from mcp.server.fastmcp import FastMCP
 
 from .config import Config
+from .store import REWRITE_THRESHOLD_CHARS, ContentTooLargeError
 
 _config = Config.from_env()
 
@@ -43,6 +44,28 @@ _store: Any = None
 _lock = threading.Lock()
 
 _F = TypeVar("_F", bound=Callable[..., Any])
+
+# Memory ids are random int64s, mostly above 2**53. JSON clients that parse
+# numbers as doubles (JavaScript) silently round them, so the tools take and
+# return ids as strings. Integers are still accepted for older callers.
+MemoryId = Union[str, int]
+
+
+def _parse_id(value: MemoryId) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"invalid memory id: {value!r}")
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text.lstrip("-").isdigit():
+        raise ValueError(f"invalid memory id: {value!r}")
+    return int(text)
+
+
+def _wire(mem: Any) -> dict[str, Any]:
+    data = mem.to_dict()
+    data["id"] = str(data["id"])
+    return data
 
 
 def store() -> Any:
@@ -71,14 +94,29 @@ def _release_after(fn: _F) -> _F:
     return wrapper  # type: ignore[return-value]
 
 
+_REWRITE_HINT = (
+    "Not written: this memory is past the append threshold "
+    f"({REWRITE_THRESHOLD_CHARS} chars). Re-store the same topic with "
+    "on_conflict='replace' and content that merges your new learning into a "
+    "compact current-truth rewrite of the existing content (keep live facts, "
+    "drop superseded history)."
+)
+
+
 @mcp.tool(
     description=(
         "Store a durable piece of knowledge in long-term memory. `topic` is a "
         "short semantic key (it becomes the searchable embedding); `content` is "
-        "the detailed knowledge. Near-duplicate topics are merged by default so "
-        "the same fact is not stored twice. Use this to remember decisions, "
-        "facts, preferences, and learnings worth recalling later. Returns the "
-        "stored memory and the action taken (created/merged/replaced/skipped)."
+        "the detailed knowledge. A near-duplicate topic updates the existing "
+        "memory: on_conflict='auto' (default) appends while the entry is small, "
+        "'replace' overwrites it with the content you pass, 'merge' always appends, "
+        "'skip' leaves it, 'new' stores a separate entry. Returns the memory and "
+        "the action taken (created/merged/replaced/skipped). If the action is "
+        "'needs_rewrite', NOTHING was written: the existing entry is too large to "
+        "keep appending to, so re-store the same topic with on_conflict='replace' "
+        "and content that folds the new learning into a compact current-truth "
+        "rewrite of the returned memory. An action of 'rejected' means the content "
+        "exceeds the hard size limit."
     )
 )
 @_release_after
@@ -88,19 +126,25 @@ def memory_store(
     tags: Optional[list[str]] = None,
     source: str = "",
     importance: float = 0.5,
-    on_conflict: str = "merge",
+    on_conflict: str = "auto",
     dedup: bool = True,
 ) -> dict[str, Any]:
-    mem, action = store().store(
-        topic,
-        content,
-        tags=tags or [],
-        source=source,
-        importance=importance,
-        on_conflict=on_conflict,  # type: ignore[arg-type]
-        dedup=dedup,
-    )
-    return {"action": action, "memory": mem.to_dict()}
+    try:
+        mem, action = store().store(
+            topic,
+            content,
+            tags=tags or [],
+            source=source,
+            importance=importance,
+            on_conflict=on_conflict,  # type: ignore[arg-type]
+            dedup=dedup,
+        )
+    except ContentTooLargeError as err:
+        return {"action": "rejected", "error": "content_too_large", "detail": str(err)}
+    result: dict[str, Any] = {"action": action, "memory": _wire(mem)}
+    if action == "needs_rewrite":
+        result["hint"] = _REWRITE_HINT
+    return result
 
 
 @mcp.tool(
@@ -127,14 +171,19 @@ def memory_recall(
         source=source,
         min_similarity=min_similarity,
     )
-    return [m.to_dict() for m in results]
+    return [_wire(m) for m in results]
 
 
-@mcp.tool(description="Fetch a single memory by its id. Returns null if not found.")
+@mcp.tool(
+    description=(
+        "Fetch a single memory by its id (pass the id as a string). Returns null "
+        "if not found."
+    )
+)
 @_release_after
-def memory_get(memory_id: int) -> Optional[dict[str, Any]]:
-    mem = store().get(memory_id)
-    return mem.to_dict() if mem else None
+def memory_get(memory_id: MemoryId) -> Optional[dict[str, Any]]:
+    mem = store().get(_parse_id(memory_id))
+    return _wire(mem) if mem else None
 
 
 @mcp.tool(
@@ -151,40 +200,49 @@ def memory_list(
     source: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     results = store().list(limit=limit, offset=offset, tags=tags or None, source=source)
-    return [m.to_dict() for m in results]
+    return [_wire(m) for m in results]
 
 
 @mcp.tool(
     description=(
-        "Update fields of an existing memory by id. Only provided fields change; "
+        "Update fields of an existing memory by id (pass the id as a string). "
+        "Only provided fields change; "
         "changing the topic re-embeds the search key. Returns the updated memory "
         "or null if the id does not exist."
     )
 )
 @_release_after
 def memory_update(
-    memory_id: int,
+    memory_id: MemoryId,
     topic: Optional[str] = None,
     content: Optional[str] = None,
     tags: Optional[list[str]] = None,
     source: Optional[str] = None,
     importance: Optional[float] = None,
 ) -> Optional[dict[str, Any]]:
-    mem = store().update(
-        memory_id,
-        topic=topic,
-        content=content,
-        tags=tags,
-        source=source,
-        importance=importance,
+    try:
+        mem = store().update(
+            _parse_id(memory_id),
+            topic=topic,
+            content=content,
+            tags=tags,
+            source=source,
+            importance=importance,
+        )
+    except ContentTooLargeError as err:
+        return {"action": "rejected", "error": "content_too_large", "detail": str(err)}
+    return _wire(mem) if mem else None
+
+
+@mcp.tool(
+    description=(
+        "Delete one or more memories by id (pass ids as strings). Returns the "
+        "number that actually existed and were deleted."
     )
-    return mem.to_dict() if mem else None
-
-
-@mcp.tool(description="Delete one or more memories by id. Returns the number deleted.")
+)
 @_release_after
-def memory_delete(memory_ids: list[int]) -> dict[str, int]:
-    return {"deleted": store().delete(memory_ids)}
+def memory_delete(memory_ids: list[MemoryId]) -> dict[str, int]:
+    return {"deleted": store().delete([_parse_id(i) for i in memory_ids])}
 
 
 @mcp.tool(description="Return the total number of stored memories.")
