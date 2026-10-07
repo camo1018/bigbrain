@@ -306,17 +306,48 @@ class MemoryStore:
         tags: list[str] | None = None,
         source: str | None = None,
     ) -> list[Memory]:
+        """Memories ordered by recency of update, most recent first.
+
+        Milvus returns query() rows in primary-key (insertion) order and Milvus
+        Lite silently ignores order_by, so sorting server-side is not an option.
+        Reading only limit/offset rows and sorting that page would make "recent
+        first" true only within one arbitrary slice of oldest-inserted rows. So
+        filter with the index where possible, then rank in Python: iterate every
+        row (a query_iterator over the local store), sort by updated_at, and slice.
+        """
         expr = _build_filter(tags, source) or "id >= 0"
-        rows = self.client.query(
-            self.config.collection,
-            filter=expr,
-            output_fields=list(Memory._PERSISTED_FIELDS),
-            limit=limit,
-            offset=offset,
-        )
-        mems = [Memory.from_entity(r) for r in rows]
+        fields = list(Memory._PERSISTED_FIELDS)
+
+        by_id: dict[int, dict] = {}
+        # Keyed by primary key while iterating: without an mvcc timestamp to pin
+        # the read, the Milvus Lite iterator can hand back a row twice across a
+        # page boundary. Keying dedupes that at no cost.
+        client = self.client
+        logger = logging.getLogger("pymilvus")
+        previous = logger.level
+        logger.setLevel(max(previous, logging.ERROR))
+        try:
+            iterator = client.query_iterator(
+                collection_name=self.config.collection,
+                filter=expr,
+                output_fields=fields,
+                batch_size=500,
+            )
+            try:
+                while True:
+                    page = iterator.next()
+                    if not page:
+                        break
+                    for entity in page:
+                        by_id[int(entity["id"])] = entity
+            finally:
+                iterator.close()
+        finally:
+            logger.setLevel(previous)
+
+        mems = [Memory.from_entity(r) for r in by_id.values()]
         mems.sort(key=lambda m: m.updated_at, reverse=True)
-        return mems
+        return mems[offset : offset + limit]
 
     def count(self) -> int:
         stats = self.client.get_collection_stats(self.config.collection)
