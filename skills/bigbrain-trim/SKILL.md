@@ -129,6 +129,25 @@ memory_store(
 )
 ```
 
+- **Bulk compaction** (many Tier-1 entries, once the user has approved compacting
+  them without per-item review): use the bundled runner instead of rewriting by
+  hand. It drives headless `pi -p`, applies a rewrite only if it is smaller and
+  keeps ≥80% of the original's distinctive identifiers (paths, dotted names,
+  constants, ticket/PR ids, backticked code), retries once with the dropped
+  identifiers listed, skips any memory the maintenance hook changed mid-run,
+  serializes writes, and saves every original first.
+
+```bash
+python scripts/compact.py --dry-run --limit 3 --model <provider/id>   # pilot, inspect <workdir>/new/
+python scripts/compact.py --model <provider/id> [--pi-arg=-e --pi-arg=<provider-extension.ts>]
+```
+
+  Use a strong model: in testing a flash-class model kept only ~55-60% of
+  identifiers on large entries and dropped live recipes, while a Sonnet-class
+  model kept 80-98%. Read `<workdir>/log.jsonl` afterwards (`status`,
+  `retention`, `missing_sample`) and spot-check a few `orig/` vs `new/` pairs.
+  Entries reported `skip_not_smaller` are already compact; leave them.
+
 - **Consolidate:** rewrite the keeper as above, then delete the losers via the
   CLI (step-2 command). Confirm the ids against the audit first.
 - **Evict:** delete via the CLI.

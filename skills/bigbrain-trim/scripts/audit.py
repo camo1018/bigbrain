@@ -33,7 +33,12 @@ from pathlib import Path
 # Markers that indicate append-churn: content rewritten as stacked corrections
 # rather than a single current-truth narrative.
 CHURN_MARKERS = ("ADDENDUM", "SUPERSEDES", "SUPERSEDED", "CORRECTION", "AS-BUILT", "UPDATE ")
-SECTION_RE = re.compile(r"^=== .* ===", re.MULTILINE)
+# A section header that carries a date is an appended update (e.g.
+# "=== 2026-07-28: STATUS ==="); undated headers are just structure, which a
+# compacted current-truth entry uses too, so they do not count as churn.
+DATED_SECTION_RE = re.compile(r"^(?:===|\*\*\*).*\b\d{4}-\d{2}-\d{2}\b.*$", re.MULTILINE)
+# A horizontal-rule divider between appended blocks.
+DIVIDER_RE = re.compile(r"^---\s*$", re.MULTILINE)
 
 # Tokens too generic to signal that two topics are about the same subject.
 _STOPWORDS = {
@@ -93,7 +98,11 @@ def tokens(text: str) -> set[str]:
 
 def churn_markers(content: str) -> int:
     upper = content.upper()
-    return sum(upper.count(m) for m in CHURN_MARKERS) + len(SECTION_RE.findall(content))
+    return (
+        sum(upper.count(m) for m in CHURN_MARKERS)
+        + len(DATED_SECTION_RE.findall(content))
+        + len(DIVIDER_RE.findall(content))
+    )
 
 
 def jaccard(a: set[str], b: set[str]) -> float:
@@ -117,9 +126,10 @@ def analyse(mems: list[dict]) -> dict:
         for t in m.get("tags", []) or []:
             tag_freq[t] = tag_freq.get(t, 0) + 1
 
-    # Tier 1: append-churn compaction. Rank by markers, then size.
+    # Tier 1: append-churn compaction. Rank by markers, then size. Size alone is
+    # not churn: a large current-truth entry with no append markers is fine.
     compaction = sorted(
-        (m for m in mems if m["_markers"] >= 2 or m["_chars"] >= 6000),
+        (m for m in mems if m["_markers"] >= 2 or (m["_chars"] >= 12000 and m["_markers"] >= 1)),
         key=lambda m: (m["_markers"], m["_chars"]), reverse=True,
     )
 
