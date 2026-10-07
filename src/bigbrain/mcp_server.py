@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import functools
 import threading
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar, Union
 
 from mcp.server.fastmcp import FastMCP
 
@@ -43,6 +43,28 @@ _store: Any = None
 _lock = threading.Lock()
 
 _F = TypeVar("_F", bound=Callable[..., Any])
+
+# Memory ids are random int64s, mostly above 2**53. JSON clients that parse
+# numbers as doubles (JavaScript) silently round them, so the tools take and
+# return ids as strings. Integers are still accepted for older callers.
+MemoryId = Union[str, int]
+
+
+def _parse_id(value: MemoryId) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"invalid memory id: {value!r}")
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text.lstrip("-").isdigit():
+        raise ValueError(f"invalid memory id: {value!r}")
+    return int(text)
+
+
+def _wire(mem: Any) -> dict[str, Any]:
+    data = mem.to_dict()
+    data["id"] = str(data["id"])
+    return data
 
 
 def store() -> Any:
@@ -100,7 +122,7 @@ def memory_store(
         on_conflict=on_conflict,  # type: ignore[arg-type]
         dedup=dedup,
     )
-    return {"action": action, "memory": mem.to_dict()}
+    return {"action": action, "memory": _wire(mem)}
 
 
 @mcp.tool(
@@ -127,14 +149,19 @@ def memory_recall(
         source=source,
         min_similarity=min_similarity,
     )
-    return [m.to_dict() for m in results]
+    return [_wire(m) for m in results]
 
 
-@mcp.tool(description="Fetch a single memory by its id. Returns null if not found.")
+@mcp.tool(
+    description=(
+        "Fetch a single memory by its id (pass the id as a string). Returns null "
+        "if not found."
+    )
+)
 @_release_after
-def memory_get(memory_id: int) -> Optional[dict[str, Any]]:
-    mem = store().get(memory_id)
-    return mem.to_dict() if mem else None
+def memory_get(memory_id: MemoryId) -> Optional[dict[str, Any]]:
+    mem = store().get(_parse_id(memory_id))
+    return _wire(mem) if mem else None
 
 
 @mcp.tool(
@@ -151,19 +178,20 @@ def memory_list(
     source: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     results = store().list(limit=limit, offset=offset, tags=tags or None, source=source)
-    return [m.to_dict() for m in results]
+    return [_wire(m) for m in results]
 
 
 @mcp.tool(
     description=(
-        "Update fields of an existing memory by id. Only provided fields change; "
+        "Update fields of an existing memory by id (pass the id as a string). "
+        "Only provided fields change; "
         "changing the topic re-embeds the search key. Returns the updated memory "
         "or null if the id does not exist."
     )
 )
 @_release_after
 def memory_update(
-    memory_id: int,
+    memory_id: MemoryId,
     topic: Optional[str] = None,
     content: Optional[str] = None,
     tags: Optional[list[str]] = None,
@@ -171,20 +199,25 @@ def memory_update(
     importance: Optional[float] = None,
 ) -> Optional[dict[str, Any]]:
     mem = store().update(
-        memory_id,
+        _parse_id(memory_id),
         topic=topic,
         content=content,
         tags=tags,
         source=source,
         importance=importance,
     )
-    return mem.to_dict() if mem else None
+    return _wire(mem) if mem else None
 
 
-@mcp.tool(description="Delete one or more memories by id. Returns the number deleted.")
+@mcp.tool(
+    description=(
+        "Delete one or more memories by id (pass ids as strings). Returns the "
+        "number that actually existed and were deleted."
+    )
+)
 @_release_after
-def memory_delete(memory_ids: list[int]) -> dict[str, int]:
-    return {"deleted": store().delete(memory_ids)}
+def memory_delete(memory_ids: list[MemoryId]) -> dict[str, int]:
+    return {"deleted": store().delete([_parse_id(i) for i in memory_ids])}
 
 
 @mcp.tool(description="Return the total number of stored memories.")

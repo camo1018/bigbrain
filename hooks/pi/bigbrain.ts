@@ -391,7 +391,7 @@ export default function bigbrainExtension(pi: ExtensionAPI) {
 		label: "Memory Get",
 		description: "Fetch a single memory by its id. Returns null if not found.",
 		parameters: Type.Object({
-			memory_id: Type.Integer({ description: "ID of the memory to fetch" }),
+			memory_id: Type.String({ description: "ID of the memory to fetch, as a string (ids exceed JS safe-integer range)" }),
 		}),
 		async execute(_toolCallId, params, signal) {
 			const res = await callMcpTool("memory_get", params, signal);
@@ -428,7 +428,7 @@ export default function bigbrainExtension(pi: ExtensionAPI) {
 		label: "Memory Update",
 		description: "Update fields of an existing memory by id. Only provided fields change; changing the topic re-embeds the search key.",
 		parameters: Type.Object({
-			memory_id: Type.Integer({ description: "ID of the memory to update" }),
+			memory_id: Type.String({ description: "ID of the memory to update, as a string (ids exceed JS safe-integer range)" }),
 			topic: Type.Optional(Type.String({ description: "New topic" })),
 			content: Type.Optional(Type.String({ description: "New content" })),
 			tags: Type.Optional(Type.Array(Type.String(), { description: "New tags" })),
@@ -448,9 +448,9 @@ export default function bigbrainExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "memory_delete",
 		label: "Memory Delete",
-		description: "Delete one or more memories by id. Returns the number deleted.",
+		description: "Delete one or more memories by id. Returns the number that actually existed and were deleted.",
 		parameters: Type.Object({
-			memory_ids: Type.Array(Type.Integer(), { description: "List of memory IDs to delete" }),
+			memory_ids: Type.Array(Type.String(), { description: "List of memory IDs to delete, as strings (ids exceed JS safe-integer range)" }),
 		}),
 		async execute(_toolCallId, params, signal) {
 			const res = await callMcpTool("memory_delete", params, signal);

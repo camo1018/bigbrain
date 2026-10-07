@@ -221,8 +221,14 @@ class MemoryStore:
         ids = [memory_ids] if isinstance(memory_ids, int) else list(memory_ids)
         if not ids:
             return 0
-        self.client.delete(self.config.collection, ids=ids)
-        return len(ids)
+        # Milvus echoes back every requested id whether or not it matched, so
+        # count the ids that actually exist; a miss must report 0, not success.
+        rows = self.client.get(self.config.collection, ids=ids, output_fields=["id"])
+        existing = [int(r["id"]) for r in rows]
+        if not existing:
+            return 0
+        self.client.delete(self.config.collection, ids=existing)
+        return len(existing)
 
     # -- read -------------------------------------------------------------
 
