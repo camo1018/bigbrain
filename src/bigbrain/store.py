@@ -536,12 +536,32 @@ def _release_milvus_server() -> None:
     flock) until process exit. That would let a single long-lived window lock
     every sibling window out, so stop the server explicitly after each op.
     """
+    _close_milvus_connections()
     try:
         from milvus_lite.server_manager import server_manager_instance
     except Exception:
         return
     try:
         server_manager_instance.release_all()
+    except Exception:
+        pass
+
+
+def _close_milvus_connections() -> None:
+    """Close pymilvus's pooled gRPC connections.
+
+    In pymilvus 3.x, ``MilvusClient.close()`` only drops the client's reference
+    to a connection shared through ``ConnectionManager``; the gRPC channel stays
+    open even with no clients left. Each op here starts Milvus Lite on a fresh
+    port, so every op registers a new connection, and a long-lived server leaks
+    its channel pipes until it hits the open-file limit.
+    """
+    try:
+        from pymilvus.client.connection_manager import ConnectionManager
+    except Exception:
+        return
+    try:
+        ConnectionManager.get_instance().close_all()
     except Exception:
         pass
 
