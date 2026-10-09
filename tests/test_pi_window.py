@@ -75,6 +75,16 @@ def run(tmp_path, passes, **env):
         "const f = () => ({});\n"
         "export const Type = new Proxy({}, { get: () => f });\n"
     )
+    # The extension renders collapsed tool results with pi-tui's Text/truncateToWidth.
+    # A stub is enough: these tests exercise the maintenance window, not rendering.
+    (work / "node_modules" / "@earendil-works" / "pi-tui").mkdir(parents=True)
+    (work / "node_modules" / "@earendil-works" / "pi-tui" / "package.json").write_text(
+        '{"name":"@earendil-works/pi-tui","type":"module","main":"index.js"}'
+    )
+    (work / "node_modules" / "@earendil-works" / "pi-tui" / "index.js").write_text(
+        "export class Text { constructor() {} render() { return []; } invalidate() {} }\n"
+        "export const truncateToWidth = (s) => s;\n"
+    )
     (work / "package.json").write_text('{"type":"module"}')
     shutil.copy(EXTENSION, work / "bigbrain.ts")
     (work / "harness.mjs").write_text(HARNESS)
