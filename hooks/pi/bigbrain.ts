@@ -16,7 +16,8 @@
 //   BIGBRAIN_MAINT_RUNNER   explicit path to bigbrain-maintenance-direct.mjs
 //   BIGBRAIN_MAINT_LOG      log file (default: ~/.bigbrain/maintenance.log)
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
+import { Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -335,6 +336,141 @@ function triggerDetachedMaintenance(ctx: ExtensionContext) {
 	}
 }
 
+// --- Collapsed-result rendering --------------------------------------------
+//
+// Pi's generic collapsed preview slices raw result lines, but each memory's
+// `content` field is a single multi-thousand-character JSON string: that one
+// line wraps across dozens of terminal rows and dwarfs the transcript. These
+// renderResult hooks summarize results while collapsed; expanded output and
+// the model-facing text are untouched.
+
+type MemoryBlock = { type: string; text?: string };
+
+const MAX_SUMMARY_ROWS = 3;
+const MAX_SUMMARY_CHARS = 160;
+
+function cleanSummary(text: string, max = MAX_SUMMARY_CHARS): string {
+	const clean = text.replace(/\s+/g, " ").trim();
+	return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
+}
+
+function summarizeMemoryBlock(kind: string, raw: string): string {
+	const trimmed = raw.trim();
+	if (trimmed === "null") return "(no result)";
+	let obj: Record<string, unknown> | null = null;
+	try {
+		const parsed = JSON.parse(trimmed);
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			obj = parsed as Record<string, unknown>;
+		}
+	} catch {
+		// Not JSON: fall through to a raw preview.
+	}
+	if (!obj) return cleanSummary(trimmed.split("\n").find((l) => l.trim()) ?? "");
+
+	const topicOf = (v: unknown): string => {
+		if (v && typeof v === "object") {
+			const topic = (v as Record<string, unknown>).topic;
+			if (typeof topic === "string" && topic.trim()) return topic;
+		}
+		return "";
+	};
+
+	switch (kind) {
+		case "recall":
+		case "list": {
+			const score = typeof obj.score === "number" ? ` (score ${obj.score.toFixed(2)})` : "";
+			return cleanSummary(`${topicOf(obj) || "(untitled)"}${score}`);
+		}
+		case "store":
+		case "update": {
+			const action = typeof obj.action === "string" ? obj.action : "done";
+			const topic = topicOf(obj.memory) || topicOf(obj);
+			return cleanSummary(`${action}${topic ? ` · ${topic}` : ""}`);
+		}
+		case "get": {
+			const topic = topicOf(obj);
+			return topic ? cleanSummary(topic) : cleanSummary(trimmed);
+		}
+		case "delete":
+			return typeof obj.deleted === "number" ? `deleted ${obj.deleted}` : cleanSummary(trimmed);
+		case "count":
+			return typeof obj.count === "number" ? `${obj.count} memories stored` : cleanSummary(trimmed);
+		default:
+			return cleanSummary(trimmed);
+	}
+}
+
+class MemoryResultComponent implements Component {
+	private cache: { width: number; lines: string[] } | null = null;
+	private readonly rows: string[];
+	private readonly totalRows: number;
+	private readonly header: string;
+	private readonly expanded: boolean;
+	private readonly fullText: string;
+	private readonly fg: (name: string, text: string) => string;
+
+	constructor(
+		rows: string[],
+		totalRows: number,
+		header: string,
+		expanded: boolean,
+		fullText: string,
+		fg: (name: string, text: string) => string,
+	) {
+		this.rows = rows;
+		this.totalRows = totalRows;
+		this.header = header;
+		this.expanded = expanded;
+		this.fullText = fullText;
+		this.fg = fg;
+	}
+
+	render(width: number): string[] {
+		if (this.expanded) return new Text(this.fullText, 0, 0).render(width);
+		const safeWidth = Math.max(1, Math.floor(width));
+		if (this.cache?.width === safeWidth) return this.cache.lines;
+		const lines: string[] = [];
+		if (this.header) lines.push(this.fg("muted", this.header));
+		for (const row of this.rows) {
+			lines.push(truncateToWidth(this.fg("toolOutput", `  ${row}`), safeWidth, "…"));
+		}
+		if (this.totalRows > this.rows.length) {
+			lines.push(this.fg("muted", `  … +${this.totalRows - this.rows.length} more (Ctrl+O to expand)`));
+		}
+		this.cache = { width: safeWidth, lines };
+		return lines;
+	}
+
+	invalidate(): void {
+		this.cache = null;
+	}
+}
+
+function renderMemoryResult(
+	kind: "recall" | "list" | "store" | "get" | "update" | "delete" | "count",
+) {
+	return (result: any, options: ToolRenderResultOptions, theme: any): Component => {
+		const fg = (name: string, text: string) => theme.fg(name, text);
+		if (options.isPartial) return new Text(fg("warning", "Querying memory..."), 0, 0);
+		const blocks = (result.content as MemoryBlock[]).filter((b) => b.type === "text");
+		const fullText = blocks.map((b) => b.text ?? "").join("\n");
+		// Errors stay verbatim: they are short and matter for diagnosis.
+		if (result.isError || options.expanded) return new Text(fullText, 0, 0);
+		const rows = blocks.map((b) => summarizeMemoryBlock(kind, b.text ?? ""));
+		const header =
+			kind === "recall" ? `${rows.length} memories matched` : kind === "list" ? `${rows.length} memories` : "";
+		return new MemoryResultComponent(
+			rows.slice(0, MAX_SUMMARY_ROWS),
+			rows.length,
+			header,
+			false,
+			fullText,
+			fg,
+		);
+	};
+}
+
 export default function bigbrainExtension(pi: ExtensionAPI) {
 	// Register background maintenance hook on turn completion
 	pi.on("agent_settled", async (_event, ctx) => {
@@ -360,6 +496,7 @@ export default function bigbrainExtension(pi: ExtensionAPI) {
 				details: {},
 			};
 		},
+		renderResult: renderMemoryResult("recall"),
 	});
 
 	// memory_store
@@ -383,6 +520,7 @@ export default function bigbrainExtension(pi: ExtensionAPI) {
 				details: {},
 			};
 		},
+		renderResult: renderMemoryResult("store"),
 	});
 
 	// memory_get
@@ -400,6 +538,7 @@ export default function bigbrainExtension(pi: ExtensionAPI) {
 				details: {},
 			};
 		},
+		renderResult: renderMemoryResult("get"),
 	});
 
 	// memory_list
@@ -420,6 +559,7 @@ export default function bigbrainExtension(pi: ExtensionAPI) {
 				details: {},
 			};
 		},
+		renderResult: renderMemoryResult("list"),
 	});
 
 	// memory_update
@@ -442,6 +582,7 @@ export default function bigbrainExtension(pi: ExtensionAPI) {
 				details: {},
 			};
 		},
+		renderResult: renderMemoryResult("update"),
 	});
 
 	// memory_delete
@@ -459,6 +600,7 @@ export default function bigbrainExtension(pi: ExtensionAPI) {
 				details: {},
 			};
 		},
+		renderResult: renderMemoryResult("delete"),
 	});
 
 	// memory_count
@@ -474,5 +616,6 @@ export default function bigbrainExtension(pi: ExtensionAPI) {
 				details: {},
 			};
 		},
+		renderResult: renderMemoryResult("count"),
 	});
 }
