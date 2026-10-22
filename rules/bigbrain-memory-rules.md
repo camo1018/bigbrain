@@ -1,0 +1,92 @@
+# bigbrain: persistent agent memory (recommended starter rule)
+
+Copy this file into your agent's global instructions (e.g. `AGENTS.md`,
+`CLAUDE.md`, or as a standalone rule file) so every session follows the same
+recall → decide → maintain loop against the bigbrain memory store. The
+`bigbrain install-hooks` installer manages a marked copy of this rule in the
+hosts it supports; keep this file as the portable source of truth and
+contribute host-specific wiring to `bigbrain install-hooks` instead of editing
+your copy by hand.
+
+If you already use `bigbrain install-hooks` for a given host, skip this file
+for that host — the installer owns the managed copy.
+
+There is a personal semantic memory store available via the `bigbrain` MCP
+server (tools: `memory_recall`, `memory_store`, `memory_list`, `memory_get`,
+`memory_update`, `memory_delete`, `memory_count`). Treat it as shared long-term
+memory across every chat and repo.
+
+## Core loop: recall → decide → maintain
+
+Memory is a living store, not an append-only log. Never blindly create a new
+entry. Every write is preceded by a recall and a decision:
+
+1. **Recall first.** Before writing anything, `memory_recall` the topic to see
+   what already exists.
+2. **Decide** based on what recall returns:
+   - **Nothing related** → `memory_store` a fresh entry.
+   - **A related entry exists** (still true, or stale/wrong) → update it in
+     place: re-`memory_store` with the *same topic phrasing* and
+     `on_conflict="replace"`, passing a rewrite that folds the new facts into
+     the existing content (keep what is still true, drop what is superseded)
+     rather than stacking addenda. `on_conflict="auto"` (the default) appends
+     only while the entry is small; if it returns `needs_rewrite`, nothing was
+     written, so rewrite and store again with `"replace"`. Keep it
+     self-contained. Prefer this over `memory_update` by numeric id, because
+     ids can exceed JavaScript's safe-integer range and round-trip lossily
+     through some MCP transports, silently targeting the wrong entry.
+   - **Duplicates/fragments discovered** → consolidate into one entry and
+     `memory_delete` the extras.
+
+Because dedup/merge keys off the `topic` embedding, reuse consistent,
+searchable topic phrasing so related writes converge on the same memory instead
+of fragmenting it.
+
+## Recall at the start of a task (MANDATORY, not optional)
+
+`memory_recall` is the **first tool call** you make on any non-trivial task —
+before searching the codebase, running commands, or writing a plan. Do it
+without being asked. "Non-trivial" = anything involving setup, debugging,
+infra, conventions, architecture, ownership, or "how did we do X" (i.e. almost
+every real task). Only a purely conversational reply or a one-line edit is
+exempt.
+
+This fires unreliably when treated as a soft nudge, so treat it as a hard step:
+
+- **On the first substantive turn** of a conversation, recall before acting.
+- **Whenever the task changes mid-conversation** (new topic, new repo/service,
+  a fresh "now do Y"), recall again for the new topic — a single recall at the
+  start does not cover later pivots.
+- Seed the query with the concrete subject (service/tool/error/decision), not a
+  generic phrase. Run 2–3 focused recalls over different phrasings if the first
+  misses.
+- Use recalled facts instead of re-deriving them. If nothing relevant returns,
+  say so briefly (or just proceed) — but do not skip the recall itself.
+
+## Writing is handled off-session
+
+If a background hook runs the maintenance pass after every substantive turn,
+outside the session, do not run the pass inline as you finish — that stores the
+same learning twice and grows entries with near-identical addenda. Write during
+a turn only when asked to remember something.
+
+For a deliberate cleanup (compacting append-churned entries, consolidating
+duplicates, evicting dead weight), use the `bigbrain-trim` skill on demand —
+never as part of routine work. If that skill is not installed in your host,
+follow the same recipe manually: audit first, propose a ranked plan and stop
+for approval before any delete.
+
+## Field guidelines
+
+- `topic`: a short, descriptive, *searchable* key (it becomes the embedding).
+  Reuse phrasing across related writes so they merge.
+- `content`: the full detail, self-contained (no references to a chat session).
+- `tags`: lowercase, reusable (e.g. `infra`, `conventions`, `gotcha`).
+- `importance`: 0.9–1.0 core/frequently-needed, 0.5 default, <0.3 niche.
+
+## Don't
+
+- Don't store secrets, credentials, or tokens.
+- Don't store one-off, throwaway, or purely conversational context.
+- Don't create a near-duplicate when an existing entry should be updated
+  instead.

@@ -240,6 +240,10 @@ places it where each host auto-loads user-level instructions:
 - All are user-level, so they apply in **every chat and every repo**, not just this one.
 - **When changes take effect:** rules load at session start, so edits apply to **new chats**.
 
+For hosts the installer doesn't manage, [`rules/bigbrain-memory-rules.md`](rules/bigbrain-memory-rules.md)
+is a portable starter rule: copy it into your agent's global instructions (`AGENTS.md`,
+`CLAUDE.md`, or a standalone rule file) as-is.
+
 ### How to add to / edit the rule
 
 It's a plain `.mdc` file: YAML frontmatter followed by Markdown instructions. Edit it to
