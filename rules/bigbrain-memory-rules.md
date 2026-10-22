@@ -1,15 +1,22 @@
-# bigbrain: persistent agent memory (recommended starter rule)
+<!--
+  HOW TO USE THIS FILE (installer commentary — everything below the rule is
+  what you actually copy into your agent's global instructions).
 
-Copy this file into your agent's global instructions (e.g. `AGENTS.md`,
-`CLAUDE.md`, or as a standalone rule file) so every session follows the same
-recall → decide → maintain loop against the bigbrain memory store. The
-`bigbrain install-hooks` installer manages a marked copy of this rule in the
-hosts it supports; keep this file as the portable source of truth and
-contribute host-specific wiring to `bigbrain install-hooks` instead of editing
-your copy by hand.
+  Copy the content under the horizontal rule into your agent's global
+  instructions (e.g. `AGENTS.md`, `CLAUDE.md`, or as a standalone rule file)
+  so every session follows the same recall → decide → maintain loop against
+  the bigbrain memory store. The `bigbrain install-hooks` installer manages a
+  marked copy of this rule in the hosts it supports; keep this file as the
+  portable source of truth and contribute host-specific wiring to
+  `bigbrain install-hooks` instead of editing your copy by hand.
 
-If you already use `bigbrain install-hooks` for a given host, skip this file
-for that host — the installer owns the managed copy.
+  If you already use `bigbrain install-hooks` for a given host, skip this file
+  for that host — the installer owns the managed copy.
+-->
+
+---
+
+# bigbrain: persistent agent memory
 
 There is a personal semantic memory store available via the `bigbrain` MCP
 server (tools: `memory_recall`, `memory_store`, `memory_list`, `memory_get`,
