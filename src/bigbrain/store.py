@@ -57,6 +57,9 @@ _MAX_ID = (1 << 63) - 1
 _LOCK_RETRY_ATTEMPTS = 50
 _LOCK_RETRY_BASE_DELAY = 0.05
 _LOCK_RETRY_MAX_DELAY = 0.5
+# Rows per query() page for full reads. Milvus Lite's own iterator returns
+# duplicates and skips rows below this, so full reads are range-split queries.
+_READ_BATCH = 500
 
 
 def _new_id() -> int:
@@ -358,42 +361,105 @@ class MemoryStore:
         Lite silently ignores order_by, so sorting server-side is not an option.
         Reading only limit/offset rows and sorting that page would make "recent
         first" true only within one arbitrary slice of oldest-inserted rows. So
-        filter with the index where possible, then rank in Python: iterate every
-        row (a query_iterator over the local store), sort by updated_at, and slice.
+        filter with the index where possible, then rank in Python: read every
+        matching row, sort by updated_at, and slice.
         """
         expr = _build_filter(tags, source) or "id >= 0"
-        fields = list(Memory._PERSISTED_FIELDS)
+        rows = self._read_all(expr)
 
-        by_id: dict[int, dict] = {}
-        # Keyed by primary key while iterating: without an mvcc timestamp to pin
-        # the read, the Milvus Lite iterator can hand back a row twice across a
-        # page boundary. Keying dedupes that at no cost.
-        client = self.client
-        logger = logging.getLogger("pymilvus")
-        previous = logger.level
-        logger.setLevel(max(previous, logging.ERROR))
-        try:
-            iterator = client.query_iterator(
-                collection_name=self.config.collection,
-                filter=expr,
-                output_fields=fields,
-                batch_size=500,
-            )
-            try:
-                while True:
-                    page = iterator.next()
-                    if not page:
-                        break
-                    for entity in page:
-                        by_id[int(entity["id"])] = entity
-            finally:
-                iterator.close()
-        finally:
-            logger.setLevel(previous)
-
-        mems = [Memory.from_entity(r) for r in by_id.values()]
+        mems = [Memory.from_entity(r) for r in rows]
         mems.sort(key=lambda m: m.updated_at, reverse=True)
         return mems[offset : offset + limit]
+
+    def _query_count(self, expr: str) -> int:
+        """How many rows match `expr`.
+
+        `count(*)` is the only exact match count Milvus Lite offers, and unlike
+        get_collection_stats it respects a filter. It is a separate call, so it
+        is not cheap enough for the write path; use it as a completeness check.
+        """
+        rows = self.client.query(
+            collection_name=self.config.collection,
+            filter=expr,
+            output_fields=["count(*)"],
+            limit=1,
+        )
+        return int(rows[0]["count(*)"]) if rows else 0
+
+    def _read_all(self, expr: str, *, batch: int = _READ_BATCH) -> list[dict]:
+        """Every row matching `expr` as a plain dict, exactly once each.
+
+        Both Milvus Lite read paths are unreliable on this store and each has to
+        be worked around, so every full read goes through here:
+
+        - `query_iterator` silently returns duplicated rows and stops early once
+          the store is past a few hundred rows (622 unique of 734 observed at
+          batch_size=500), so a paginated read loses records without any error.
+        - A single `query()` honors `limit` but also caps its result window, so
+          one big query cannot return the whole collection either.
+
+        So: query by int64 primary-key range, recursively splitting whenever a
+        range comes back full, and copy each page into plain dicts *before* the
+        next query runs. The copy is load-bearing -- the entity dicts handed back
+        by one query go stale (nullable fields like `tags` read back as None)
+        once another query has run against the same client.
+
+        A full page is discarded rather than kept. It was truncated, so it is only
+        an arbitrary prefix of the range, and its two children cover that same key
+        range between them; a leaf (a range that came back short, or a single id)
+        is the only place a complete page can be read. Against a real store this
+        both keeps the read exact and avoids handing back the same row twice.
+        """
+        if batch < 1:
+            raise ValueError("batch must be at least 1")
+
+        fields = list(Memory._PERSISTED_FIELDS)
+        client = self.client
+        # `id >= 0` is this module's "no filter" sentinel; keep the expression the
+        # caller passed otherwise, so tag/source filters survive the split.
+        extra = "" if expr == "id >= 0" else f" and {expr}"
+        out: list[dict] = []
+
+        def read_range(lower: int, upper: int) -> None:
+            rows = client.query(
+                collection_name=self.config.collection,
+                filter=f"id >= {lower} and id <= {upper}{extra}",
+                output_fields=fields,
+                limit=batch,
+            )
+            if len(rows) >= batch and lower != upper:
+                midpoint = (lower + upper) // 2
+                read_range(lower, midpoint)
+                read_range(midpoint + 1, upper)
+                return
+            out.extend({key: row[key] for key in fields if key in row} for row in rows)
+
+        read_range(0, _MAX_ID)
+
+        by_id = {int(row["id"]): row for row in out}
+        self._warn_if_short(expr, len(by_id))
+        return list(by_id.values())
+
+    def _warn_if_short(self, expr: str, found: int) -> None:
+        """Log a warning when a full read disagrees with the match count.
+
+        Deliberately a warning and not an exception: the count is a separate call,
+        so a concurrent insert or delete between the two legitimately makes them
+        differ. `export_rows` is where a short read is fatal, because a sync reads
+        a missing memory as a deletion.
+        """
+        try:
+            expected = self._query_count(expr)
+        except Exception:  # pragma: no cover - diagnostics only
+            return
+        if found < expected:
+            logging.getLogger(__name__).warning(
+                "read %d of %d memories matching %r from %s",
+                found,
+                expected,
+                expr,
+                self.config.db_path,
+            )
 
     def count(self) -> int:
         stats = self.client.get_collection_stats(self.config.collection)
@@ -401,60 +467,25 @@ class MemoryStore:
 
     # -- replication ------------------------------------------------------
 
-    def export_rows(self, *, batch: int = 500) -> list[dict]:
+    def export_rows(self, *, batch: int = _READ_BATCH) -> list[dict]:
         """Every stored memory as a plain row, for syncing with another store.
 
         The vector is left out: it is derived from the topic, so the receiving side
         recomputes it with its own model instead of trusting ours.
-
-        Paging uses the query iterator rather than limit/offset because Milvus caps
-        the offset+limit window, which a store this is meant to grow would hit.
         """
-        fields = list(Memory._PERSISTED_FIELDS)
-        # Keyed by primary key while iterating: without an mvcc timestamp to pin the
-        # read, the Milvus Lite iterator can hand back a row twice across a page
-        # boundary. Keying dedupes that at no cost.
-        by_id: dict[int, dict] = {}
-
-        # That same missing timestamp makes the iterator log a warning per page about
-        # falling back to a client-side one. It is expected, and would otherwise be
-        # the loudest thing a sync prints. Connect before muting: pymilvus reinstates
-        # its own logger level when a client is constructed, which would undo this.
-        client = self.client
-        logger = logging.getLogger("pymilvus")
-        previous = logger.level
-        logger.setLevel(max(previous, logging.ERROR))
-        try:
-            iterator = client.query_iterator(
-                collection_name=self.config.collection,
-                filter="id >= 0",
-                output_fields=fields,
-                batch_size=batch,
-            )
-            try:
-                while True:
-                    page = iterator.next()
-                    if not page:
-                        break
-                    for entity in page:
-                        by_id[int(entity["id"])] = {
-                            k: entity[k] for k in fields if k in entity
-                        }
-            finally:
-                iterator.close()
-        finally:
-            logger.setLevel(previous)
+        rows = self._read_all("id >= 0", batch=batch)
+        by_id = {int(row["id"]): row for row in rows}
 
         # A short export is dangerous rather than merely wrong: a sync compares this
         # list against the peer's, so silently missing memories read as deletions and
         # would be propagated. Fail loudly instead.
-        expected = self.count()
+        expected = self._query_count("id >= 0")
         if len(by_id) < expected:
             raise RuntimeError(
                 f"exported only {len(by_id)} of {expected} memories from "
                 f"{self.config.db_path}; refusing to hand back a partial export"
             )
-        return list(by_id.values())
+        return [by_id[mid] for mid in sorted(by_id)]
 
     def import_rows(self, rows: list[dict]) -> int:
         """Write rows from another store verbatim, keeping their ids and timestamps.
