@@ -323,9 +323,17 @@ function findOnPath(name) {
 
 // Returns the argv prefix that launches Pi, or null. The Pi extension sends the CLI entry
 // point of the running Pi, which is exact even when `pi` is not on this process's PATH.
+// Returns the argv prefix that launches Pi, or null. The Pi extension sends how the running
+// Pi was started, which is exact even when `pi` is not on this process's PATH: Node plus
+// the CLI script, or, for a self-contained (Bun-compiled) Pi, the binary alone. Older
+// extensions sent a pi_cli inside Bun's virtual filesystem (/$bunfs/...) for the latter.
 function resolvePiCommand(payload) {
 	if (payload.pi_cli && existsSync(payload.pi_cli)) {
 		return [payload.pi_node && existsSync(payload.pi_node) ? payload.pi_node : process.execPath, payload.pi_cli];
+	}
+	const compiled = !payload.pi_cli || payload.pi_cli.startsWith("/$bunfs/");
+	if (compiled && payload.pi_node && existsSync(payload.pi_node) && !/(^|[\\/])node(\.exe)?$/.test(payload.pi_node)) {
+		return [payload.pi_node];
 	}
 	const onPath = findOnPath("pi");
 	return onPath ? [onPath] : null;
@@ -339,13 +347,26 @@ function resolvePiExtension(payload) {
 	].find((p) => p && existsSync(p)) || null;
 }
 
-async function runPi(fullPrompt, { command, extension, model }) {
+// Extra extensions to load in the child, from the environment or the payload. A host that
+// authenticates its model provider through an extension needs this: the child runs with
+// --no-extensions, so without it every provider the extension registers is unavailable.
+function resolveExtraExtensions(payload) {
+	const paths = (process.env.BIGBRAIN_MAINT_PI_EXTENSIONS || "")
+		.split(",")
+		.map((s) => s.trim())
+		.filter(Boolean);
+	const fromPayload = Array.isArray(payload.pi_extra_extensions) ? payload.pi_extra_extensions : [];
+	return [...new Set([...fromPayload, ...paths])].filter((p) => existsSync(p));
+}
+
+async function runPi(fullPrompt, { command, extension, model, payload }) {
 	const args = [
 		...command.slice(1),
 		"--print",
 		"--mode", "json",
 		"--no-session",
 		"--no-extensions", "--extension", extension,
+		...resolveExtraExtensions(payload).flatMap((p) => ["--extension", p]),
 		"--tools", PI_TOOLS,
 		"--no-skills",
 		"--no-prompt-templates",
@@ -490,7 +511,7 @@ async function main() {
 		let res;
 		let label;
 		if (provider === "pi") {
-			res = await runPi(fullPrompt, { ...chosen.pi, model });
+			res = await runPi(fullPrompt, { ...chosen.pi, model, payload });
 			label = `pi ${res.model} tools=${res.toolCalls}`;
 		} else {
 			const run = provider === "anthropic" ? runAnthropic : runGemini;

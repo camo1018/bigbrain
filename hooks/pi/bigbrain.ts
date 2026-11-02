@@ -21,7 +21,7 @@ import { Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -50,6 +50,33 @@ const RUNNER_CANDIDATES = [
 
 function resolveRunner(): string | null {
 	return RUNNER_CANDIDATES.find((p) => existsSync(p)) ?? null;
+}
+
+// The runner is a plain Node script. Under a Node-hosted Pi, process.execPath is that Node.
+// Under a self-contained (Bun-compiled) Pi binary, process.execPath is Pi itself, and
+// spawning it with the runner path opens a new Pi session whose prompt is the two file
+// paths, so the pass never runs. In that case find a real `node` instead.
+const NODE_FALLBACK_DIRS = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
+
+function resolveNode(): string | null {
+	if (process.env.BIGBRAIN_MAINT_NODE && existsSync(process.env.BIGBRAIN_MAINT_NODE)) {
+		return process.env.BIGBRAIN_MAINT_NODE;
+	}
+	if (!process.versions.bun) return process.execPath;
+	const dirs = [...(process.env.PATH || "").split(delimiter), ...NODE_FALLBACK_DIRS];
+	for (const dir of dirs) {
+		if (!dir) continue;
+		const candidate = join(dir, "node");
+		if (existsSync(candidate)) return candidate;
+	}
+	return null;
+}
+
+// How the runner should start a headless Pi like this one: Node plus the CLI script, or a
+// compiled binary on its own (its argv[1] points into Bun's virtual filesystem, /$bunfs/).
+function piLaunch(): { pi_node: string; pi_cli?: string } {
+	if (process.versions.bun) return { pi_node: process.execPath };
+	return { pi_node: process.execPath, pi_cli: process.argv[1] };
 }
 
 // The runner drives the pass through a headless Pi so it reuses this Pi's providers and
@@ -301,6 +328,11 @@ function triggerDetachedMaintenance(ctx: ExtensionContext) {
 		logNote(`session=${sessionId} skipped: direct runner not found (tried ${RUNNER_CANDIDATES.join(", ")})`);
 		return;
 	}
+	const node = resolveNode();
+	if (!node) {
+		logNote(`session=${sessionId} skipped: no node binary found to run the direct runner (set BIGBRAIN_MAINT_NODE)`);
+		return;
+	}
 	const payloadFile = join(HOOK_DIR, `pi-${sessionId}-${Date.now()}.json`);
 
 	try {
@@ -311,14 +343,13 @@ function triggerDetachedMaintenance(ctx: ExtensionContext) {
 				session_id: sessionId,
 				cwd: ctx.cwd,
 				turn_text: turnText,
-				pi_node: process.execPath,
-				pi_cli: process.argv[1],
+				...piLaunch(),
 				pi_extension: thisExtensionPath(),
 				pi_model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 			})
 		);
 
-		const child = spawn(process.execPath, [runner, payloadFile], {
+		const child = spawn(node, [runner, payloadFile], {
 			detached: true,
 			stdio: "ignore",
 			env: {

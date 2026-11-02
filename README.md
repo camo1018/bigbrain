@@ -348,7 +348,17 @@ already set.
 # ~/.bigbrain/env
 BIGBRAIN_MAINT_PI_MODEL=<provider>/<model>   # any model `pi --list-models` shows
 BIGBRAIN_MAINT_PI_THINKING=low               # optional; off|minimal|low|medium|high
+BIGBRAIN_MAINT_NODE=/usr/local/bin/node      # optional; see below
+BIGBRAIN_MAINT_PI_EXTENSIONS=<file>,<file>   # optional; extra extensions for the child Pi
 ```
+
+`BIGBRAIN_MAINT_NODE` matters when `pi` is a self-contained (Bun-compiled) binary: there
+`process.execPath` is Pi itself, so the extension needs a real `node` to run the detached
+runner and falls back to searching `PATH`, then `/opt/homebrew/bin`, `/usr/local/bin`, and
+`/usr/bin`. Set it explicitly if none of those resolve and the log reports
+`skipped: no node binary found`. `BIGBRAIN_MAINT_PI_EXTENSIONS` is for hosts whose model
+provider is registered by an extension: the child Pi runs with `--no-extensions` plus only
+the bigbrain extension, so any other provider extension must be listed here to be loaded.
 
 `bigbrain install-hooks --pi-model <provider>/<model>` writes the first line for you (the file
 is kept at mode 0600). Without it, the pass uses the model of the Pi session that ran the turn,
