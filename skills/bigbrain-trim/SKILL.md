@@ -97,6 +97,32 @@ memories — over-merging hurts recall precision.
 0-access entry can still be valuable reference. Propose deletions only for truly
 transient, fully-superseded, or no-longer-true entries.
 
+**Group tags (`pi-group:<id>`) — never lose one.** If your host tags memories
+with a group/provenance tag (e.g. `pi-group:<group-id>`) to inject group-scoped
+context on recall, that tag is the *only* thing the host filters on. A memory
+that loses it silently drops out of that group's context, with no error on
+either side. Two rules, both load-bearing:
+
+- **Rewrites are safe, but only via `store --on-conflict replace`.**
+  `Store.upsert` ends with `existing.tags = sorted(set(existing.tags) | set(tags))`
+  *after* the replace branch, so a same-topic `store --on-conflict replace`
+  **unions** tags even if the list you pass omits the group tag. Hand-computing
+  the union is unnecessary (harmless, but not what protects you).
+- **`update --tags` and bare deletes are not safe.** `Store.update` assigns
+  `mem.tags = sorted({...})` with **no union**, so `update <id> --tags …` or
+  `memory_update(tags=[...])` silently strips every group tag it omits. Never
+  compact with `update`; never delete a group-tagged memory until its tag is
+  carried over.
+- **Consolidation is where tags actually get lost.** Deleting a loser destroys
+  its tags. Before deleting, union *every* loser's group tag onto the keeper (a
+  `store --on-conflict replace` write does this on its own — pass the loser tags
+  explicitly anyway so the intent is legible). A memory can belong to several
+  groups; the keeper must hold all of them.
+- **Only exception:** the group itself no longer exists. Resolve each group tag
+  against the host's group registry; a tag whose group id is absent there is
+  dead provenance and may be dropped. When in doubt, keep it: a stale tag costs
+  one filter miss, a lost tag costs the group's whole memory.
+
 **Tier 4 — Tag hygiene (optional).** Fold synonym/singleton tags toward whatever
 vocabulary your store has settled on (e.g. `project-map`, `gotcha`,
 `conventions`, `infra`, ...) *while* doing Tier-1/2 rewrites. Don't run a
@@ -148,9 +174,14 @@ python scripts/compact.py --model <provider/id> [--pi-arg=-e --pi-arg=<provider-
   `retention`, `missing_sample`) and spot-check a few `orig/` vs `new/` pairs.
   Entries reported `skip_not_smaller` are already compact; leave them.
 
-- **Consolidate:** rewrite the keeper as above, then delete the losers via the
-  CLI (step-2 command). Confirm the ids against the audit first.
-- **Evict:** delete via the CLI.
+- **Consolidate:** rewrite the keeper as above — **carrying over every loser's
+  group tag** — then delete the losers via the CLI (step-2 command). Confirm the
+  ids against the audit first. Before deleting a loser, check its tags; if it
+  holds a group tag the keeper lacks (and that group still exists), the keeper's
+  write must add it first.
+- **Evict:** delete via the CLI. Any group tag on an evicted memory dies with
+  it; if that group still exists and the fact is worth keeping anywhere,
+  consolidate instead of evicting.
 
 If a `topic` itself must change (rare), that is effectively a new key: store the
 new entry, then CLI-delete the old id — do not rely on `replace` to move a key.
@@ -161,7 +192,22 @@ new entry, then CLI-delete the old id — do not rely on `replace` to move a key
   findable at the top.
 - `bigbrain count` (or `memory_count`) and re-run the audit to confirm the
   store shrank and no live memory was dropped.
-- Report: memories compacted / consolidated / deleted, and tokens reclaimed.
+- **Diff the group tag census** (if your host uses group tags). Snapshot before
+  the trim and compare after:
+
+```bash
+python scripts/group_tags.py --snapshot before.json
+# ...trim...
+python scripts/group_tags.py --baseline before.json --groups-json <registry>.json
+```
+
+  It exits 1 if any group vanished or shrank, naming the memory ids that stopped
+  carrying the tag. Every group that existed before must still be present, with
+  a count no lower than before — groups normally only gain memories. A group
+  that disappears or shrinks is a lost memory: investigate before reporting
+  success. A brand-new group tag is fine (new memories written mid-run).
+- Report: memories compacted / consolidated / deleted, tokens reclaimed, and the
+  group-tag census delta (expected: unchanged or grew).
 
 ## Guardrails
 
@@ -171,4 +217,9 @@ new entry, then CLI-delete the old id — do not rely on `replace` to move a key
 - **Same topic on replace.** Changing the topic is a key move, not an edit.
 - **CLI for deletes.** Never trust numeric-id deletes over MCP.
 - **Consolidate real duplicates only.** Keep distinct memories distinct.
+- **Never lose a group tag unless that group is gone.** `store --on-conflict
+  replace` unions tags, `update --tags` replaces them — compact, never `update`.
+  Carry loser tags onto the keeper before deleting, and verify with the tag
+  census in step 5. A memory can belong to several groups; the keeper must hold
+  all of them. Only a tag whose group no longer exists may be dropped.
 - **On-demand only.** This is not the per-turn hook; run it when asked.
