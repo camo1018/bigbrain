@@ -83,12 +83,14 @@ never as part of routine work. If that skill is not installed in your host,
 follow the same recipe manually: audit first, propose a ranked plan and stop
 for approval before any delete.
 
-Memories may carry `pi-group:<id>` tags that a group-scoped host uses to inject
-context; a lost tag silently drops the memory from that group with no error. A
-trim must never drop one. Compact with a same-topic `store --on-conflict
-replace` (it unions tags) or a tag list that includes the group tag — never with
-`update --tags`, which replaces the list. Before deleting a memory, carry its
-group tags onto a keeper. Only a tag whose group no longer exists may go.
+Memories may carry `pi-group:<id>` tags, written by the `group-memory` extension
+in [pi-kit](https://github.com/camo1018/pi-kit), which injects group-scoped
+context on recall by filtering on that tag; a lost tag silently drops the memory
+from that group with no error. A trim must never drop one. Compact with a
+same-topic `store --on-conflict replace` (it unions tags) or a tag list that
+includes the group tag — never with `update --tags`, which replaces the list.
+Before deleting a memory, carry its group tags onto a keeper. Only a tag whose
+group no longer exists may go.
 
 ## Field guidelines
 

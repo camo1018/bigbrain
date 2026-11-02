@@ -97,11 +97,15 @@ memories — over-merging hurts recall precision.
 0-access entry can still be valuable reference. Propose deletions only for truly
 transient, fully-superseded, or no-longer-true entries.
 
-**Group tags (`pi-group:<id>`) — never lose one.** If your host tags memories
-with a group/provenance tag (e.g. `pi-group:<group-id>`) to inject group-scoped
-context on recall, that tag is the *only* thing the host filters on. A memory
-that loses it silently drops out of that group's context, with no error on
-either side. Two rules, both load-bearing:
+**Group tags (`pi-group:<id>`) — never lose one.** A store can carry
+`pi-group:<group-id>` tags. They are written by the
+[`group-memory`](https://github.com/camo1018/pi-kit/tree/main/extensions/group-memory)
+extension in [pi-kit](https://github.com/camo1018/pi-kit), which injects
+group-scoped context on recall by filtering on exactly that tag. Bigbrain itself
+does not depend on pi-kit — the tag is ordinary data, and a different client may
+use its own prefix — but if a store holds `pi-group:` tags and you trim it, a
+lost tag **silently** removes that memory from the group's context, with no
+error on either side. Two rules, both load-bearing:
 
 - **Rewrites are safe, but only via `store --on-conflict replace`.**
   `Store.upsert` ends with `existing.tags = sorted(set(existing.tags) | set(tags))`
@@ -118,10 +122,10 @@ either side. Two rules, both load-bearing:
   `store --on-conflict replace` write does this on its own — pass the loser tags
   explicitly anyway so the intent is legible). A memory can belong to several
   groups; the keeper must hold all of them.
-- **Only exception:** the group itself no longer exists. Resolve each group tag
-  against the host's group registry; a tag whose group id is absent there is
-  dead provenance and may be dropped. When in doubt, keep it: a stale tag costs
-  one filter miss, a lost tag costs the group's whole memory.
+- **Only exception:** the group itself no longer exists. Resolve each
+  `pi-group:` id against the client's group registry; a tag whose group id is
+  absent there is dead provenance and may be dropped. When in doubt, keep it: a
+  stale tag costs one filter miss, a lost tag costs the group's whole memory.
 
 **Tier 4 — Tag hygiene (optional).** Fold synonym/singleton tags toward whatever
 vocabulary your store has settled on (e.g. `project-map`, `gotcha`,
@@ -192,13 +196,13 @@ new entry, then CLI-delete the old id — do not rely on `replace` to move a key
   findable at the top.
 - `bigbrain count` (or `memory_count`) and re-run the audit to confirm the
   store shrank and no live memory was dropped.
-- **Diff the group tag census** (if your host uses group tags). Snapshot before
-  the trim and compare after:
+- **Diff the group tag census** (if the store carries `pi-group:` tags).
+  Snapshot before the trim and compare after:
 
 ```bash
 python scripts/group_tags.py --snapshot before.json
 # ...trim...
-python scripts/group_tags.py --baseline before.json --groups-json <registry>.json
+python scripts/group_tags.py --baseline before.json
 ```
 
   It exits 1 if any group vanished or shrank, naming the memory ids that stopped

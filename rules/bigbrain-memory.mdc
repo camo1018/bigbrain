@@ -64,12 +64,14 @@ For a deliberate cleanup (compacting append-churned entries, consolidating
 duplicates, evicting dead weight), use the `bigbrain-trim` skill on demand —
 never as part of routine work.
 
-Memories may carry `pi-group:<id>` tags that a group-scoped host uses to inject
-context; a lost tag silently drops the memory from that group with no error. A
-trim must never drop one. Compact with a same-topic `store --on-conflict
-replace` (it unions tags) or a tag list that includes the group tag — never with
-`update --tags`, which replaces the list. Before deleting a memory, carry its
-group tags onto a keeper. Only a tag whose group no longer exists may go.
+Memories may carry `pi-group:<id>` tags, written by the `group-memory` extension
+in [pi-kit](https://github.com/camo1018/pi-kit), which injects group-scoped
+context on recall by filtering on that tag; a lost tag silently drops the memory
+from that group with no error. A trim must never drop one. Compact with a
+same-topic `store --on-conflict replace` (it unions tags) or a tag list that
+includes the group tag — never with `update --tags`, which replaces the list.
+Before deleting a memory, carry its group tags onto a keeper. Only a tag whose
+group no longer exists may go.
 
 ## Field guidelines
 - `topic`: a short, descriptive, *searchable* key (it becomes the embedding).

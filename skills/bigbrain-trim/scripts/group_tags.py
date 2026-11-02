@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""Report group/provenance tag coverage, and flag tags whose group is gone.
+"""Report `pi-group:` tag coverage, and flag tags whose group is gone.
 
-A host may tag memories with a group/provenance tag (`<prefix><group-id>`) and
-inject group-scoped context by filtering recall on exactly that tag. Trimming
-rewrites and deletes memories, so it is the operation most likely to cause one
-of those tags to be lost — and a lost tag fails silently: the memory simply
-stops appearing in that group, with no error on either side.
+`pi-group:<group-id>` tags are written into a bigbrain store by the
+[`group-memory`](https://github.com/camo1018/pi-kit/tree/main/extensions/group-memory)
+extension in [pi-kit](https://github.com/camo1018/pi-kit). That extension
+injects group-scoped context on recall by filtering on exactly that tag, so a
+memory that loses it simply stops appearing in that group, with no error on
+either side. Trimming rewrites and deletes memories, so it is the operation most
+likely to cause that — see the group-tag section in SKILL.md.
+
+Bigbrain itself does not depend on pi or pi-kit: the tag is ordinary data that
+any client can use. The helpers here default to `pi-group:` because that is the
+contract pi-kit's `group-memory` writes; pass --prefix if your client uses a
+different one. Group ids can be resolved against a registry JSON whose
+`groups[]` entries carry `id` (and optionally `name`); without --groups-json,
+no live/dead verdict is given and only the census is reported.
 
 This script is READ-ONLY. Run it before and after a trim:
 
     python group_tags.py --snapshot before.json
     ...trim...
     python group_tags.py --baseline before.json     # exits 1 on any loss
-
-Default tag prefix is `pi-group:`; override with --prefix. Group ids are
-resolved against a registry JSON whose `groups[]` entries carry `id` (and
-optionally `name`) when you have one; without --groups-json, every tag is
-reported without a live/dead verdict.
 
 Two independent checks:
   1. census delta - every group present before must still be present, with a
